@@ -1,0 +1,4 @@
+/target/
+**/.notes/*.sqlite
+**/.notes/*.sqlite-shm
+**/.notes/*.sqlite-wal
