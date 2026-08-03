@@ -332,6 +332,38 @@ pub struct CardRow {
     pub id: i64,
     pub label: String,
     pub decks: Vec<i64>,
+    pub section_uid: String,
+    pub card_type: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ArchivedItem {
+    Note {
+        note_id: String,
+        title: String,
+        path: PathBuf,
+        section_count: usize,
+        quiz_count: usize,
+    },
+    Section {
+        uid: String,
+        note_title: String,
+        heading: String,
+        path: PathBuf,
+        start_line: usize,
+        quiz_count: usize,
+    },
+    Quiz {
+        section_uid: String,
+        quiz_id: String,
+        label: String,
+        card_count: usize,
+    },
+    Deck {
+        id: i64,
+        name: String,
+        quiz_count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Default)]

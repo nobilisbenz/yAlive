@@ -26,8 +26,8 @@ use regex::Regex;
 use crate::config::{Config, ReviewOrder};
 use crate::db::Database;
 use crate::model::{
-    CardContent, CardRow, ChoiceMode, DeckRow, GapDefinition, NoteRow, RelationRow, ReviewCard,
-    ReviewSectionRow, SectionRow, Statistics,
+    ArchivedItem, CardContent, CardRow, ChoiceMode, DeckRow, GapDefinition, NoteRow, RelationRow,
+    ReviewCard, ReviewSectionRow, SectionRow, Statistics,
 };
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
@@ -50,6 +50,7 @@ enum Page {
     Statistics,
     Clean,
     Options,
+    Archived,
 }
 
 #[derive(Clone, Copy)]
@@ -159,6 +160,7 @@ pub struct App {
     review_sections: Vec<ReviewSectionRow>,
     decks: Vec<DeckRow>,
     cards: Vec<CardRow>,
+    archived: Vec<ArchivedItem>,
     orphan_images: Vec<PathBuf>,
     statistics: Statistics,
     selected: usize,
@@ -188,6 +190,7 @@ impl App {
         let review_sections = db.review_sections()?;
         let decks = db.decks()?;
         let cards = db.card_rows()?;
+        let archived = db.archived_items()?;
         let orphan_images = find_orphan_images(&vault)?;
         let statistics = db.statistics()?;
         Ok(Self {
@@ -199,6 +202,7 @@ impl App {
             review_sections,
             decks,
             cards,
+            archived,
             orphan_images,
             statistics,
             selected: 0,
@@ -215,7 +219,7 @@ impl App {
             review: None,
             create_vault: false,
             next_vault: None,
-            status: "[1] Dashboard  [2] Reviews  [3] Relations  [4] Statistics  [5] Clean  [6] Options  j/k select  q quit".into(),
+            status: "[1] Dashboard  [2] Reviews  [3] Relations  [4] Statistics  [5] Clean  [6] Options  [7] Archived".into(),
             last_index: Instant::now(),
         })
     }
@@ -268,6 +272,7 @@ impl App {
             Page::Statistics => 1,
             Page::Clean => self.clean_items().len(),
             Page::Options => 7,
+            Page::Archived => self.archived.len(),
         };
         self.selected = self.selected.min(total.saturating_sub(1));
         Ok(())
@@ -297,14 +302,15 @@ impl App {
     }
 
     fn handle_browse(&mut self, key: KeyEvent, terminal: &mut Tui) -> Result<bool> {
-        if let KeyCode::Char(page @ '1'..='6') = key.code {
+        if let KeyCode::Char(page @ '1'..='7') = key.code {
             self.page = match page {
                 '1' => Page::Dashboard,
                 '2' => Page::Reviews,
                 '3' => Page::Relations,
                 '4' => Page::Statistics,
                 '5' => Page::Clean,
-                _ => Page::Options,
+                '6' => Page::Options,
+                _ => Page::Archived,
             };
             self.selected = 0;
             self.scroll = 0;
@@ -377,6 +383,12 @@ impl App {
             KeyCode::Char('a') if self.page == Page::Reviews => self.toggle_selected_card_deck()?,
             KeyCode::Char('a') if self.page == Page::Clean => self.assign_clean_card()?,
             KeyCode::Char('d') if self.page == Page::Clean => self.delete_clean_image()?,
+            KeyCode::Char('x')
+                if matches!(self.page, Page::Dashboard | Page::Reviews | Page::Clean) =>
+            {
+                self.archive_selected()?
+            }
+            KeyCode::Char('u') if self.page == Page::Archived => self.restore_selected()?,
             KeyCode::Left | KeyCode::Char('h')
                 if self.page == Page::Options && self.selected < 5 =>
             {
@@ -392,7 +404,6 @@ impl App {
             {
                 self.change_option(1)?
             }
-            KeyCode::Char('x') if self.page == Page::Reviews => self.delete_active_deck()?,
             KeyCode::Char('e') if self.page == Page::Dashboard => self.open_selected(terminal)?,
             KeyCode::Char('o') if self.page == Page::Dashboard => self.open_selected_url()?,
             KeyCode::Char('i') if self.page == Page::Dashboard => self.open_selected_image()?,
@@ -722,6 +733,12 @@ impl App {
             Page::Options => {
                 self.selected = self.selected.saturating_add_signed(amount).min(6);
             }
+            Page::Archived => {
+                self.selected = self
+                    .selected
+                    .saturating_add_signed(amount)
+                    .min(self.archived.len().saturating_sub(1));
+            }
         }
     }
 
@@ -731,7 +748,7 @@ impl App {
         } else {
             match self.page {
                 Page::Dashboard => &[(0, 0), (1, 0), (1, 1), (2, 1)],
-                Page::Reviews | Page::Clean | Page::Options => &[(0, 0), (1, 0)],
+                Page::Reviews | Page::Clean | Page::Options | Page::Archived => &[(0, 0), (1, 0)],
                 Page::Relations => &[(0, 0), (1, 0), (2, 0)],
                 Page::Statistics => &[(0, 0), (1, 0), (2, 0), (0, 1), (3, 0), (3, 1), (3, 2)],
             }
@@ -886,6 +903,7 @@ impl App {
         self.review_sections = self.db.review_sections()?;
         self.decks = self.db.decks()?;
         self.cards = self.db.card_rows()?;
+        self.archived = self.db.archived_items()?;
         self.statistics = self.db.statistics()?;
         self.active_deck = self.active_deck.min(self.decks.len().saturating_sub(1));
         if self.page == Page::Relations {
@@ -897,21 +915,22 @@ impl App {
     fn set_page_status(&mut self) {
         self.status = match self.page {
             Page::Dashboard => {
-                "[1-6] pages  Enter open  n new note  / search  S-h/l left/right  S-j/k down/up"
+                "[1-7] pages  Enter open  n new note  x archive  / search  S-h/l left/right"
             }
             Page::Reviews => {
-                "[1-6] pages  r review due  R reload  Space enroll  a assign  S-h/l left/right"
+                "[1-7] pages  r review due  Space enroll  a assign  x archive  S-h/l left/right"
             }
             Page::Relations => {
-                "[1-6] pages  j/k select  Enter follow/open  S-h/l left/right  S-j/k down/up"
+                "[1-7] pages  j/k select  Enter follow/open  S-h/l left/right  S-j/k down/up"
             }
-            Page::Statistics => "[1-6] pages  j/k scroll  S-h/l left/right  S-j/k down/up",
+            Page::Statistics => "[1-7] pages  j/k scroll  S-h/l left/right  S-j/k down/up",
             Page::Clean => {
-                "[1-6] pages  Enter open  a assign card  d delete image  S-h/l left/right  S-j/k down/up"
+                "[1-7] pages  Enter open  a assign  x archive  d delete image  S-h/l left/right"
             }
             Page::Options => {
-                "[1-6] pages  j/k select  h/l change  Space toggle  S-h/l left/right  S-j/k down/up"
+                "[1-7] pages  j/k select  h/l change  Space toggle  S-h/l left/right  S-j/k down/up"
             }
+            Page::Archived => "[1-7] pages  j/k select  u restore  Enter open source",
         }
         .into();
     }
@@ -968,13 +987,90 @@ impl App {
         Ok(())
     }
 
-    fn delete_active_deck(&mut self) -> Result<()> {
-        if let Some(deck) = self.decks.get(self.active_deck) {
-            let name = deck.name.clone();
-            self.db.delete_deck(deck.id)?;
-            self.refresh_views()?;
-            self.status = format!("deleted deck {name}");
-        }
+    fn archive_selected(&mut self) -> Result<()> {
+        let status = match self.page {
+            Page::Dashboard => match self.dashboard_items().get(self.selected).copied() {
+                Some(DashboardItem::Note(index)) => {
+                    let note = &self.notes[index];
+                    self.db.archive_note(&note.path)?;
+                    format!("archived note {} and its contents", note.title)
+                }
+                Some(DashboardItem::Section(index)) => {
+                    let section = &self.sections[index];
+                    self.db.archive_section(&section.uid)?;
+                    format!("archived section {}", section.heading)
+                }
+                None => return Ok(()),
+            },
+            Page::Reviews => match self.review_items().get(self.selected).copied() {
+                Some(ReviewItem::Section(index)) => {
+                    let section = &self.review_sections[index];
+                    self.db.archive_section(&section.uid)?;
+                    format!("archived section {}", section.heading)
+                }
+                Some(ReviewItem::Deck(index)) => {
+                    let deck = &self.decks[index];
+                    self.db.archive_deck(deck.id)?;
+                    format!("archived deck {} and its exclusive quizzes", deck.name)
+                }
+                Some(ReviewItem::Card(index)) => {
+                    let card = &self.cards[index];
+                    if card.card_type == "section-review" {
+                        self.db.archive_section(&card.section_uid)?;
+                        format!("archived section review {}", card.label)
+                    } else {
+                        self.db.archive_quiz(card.id)?;
+                        format!("archived quiz {}", card.label)
+                    }
+                }
+                None => return Ok(()),
+            },
+            Page::Clean => match self.clean_items().get(self.selected).copied() {
+                Some(CleanItem::Note(index)) => {
+                    let note = &self.notes[index];
+                    self.db.archive_note(&note.path)?;
+                    format!("archived note {} and its contents", note.title)
+                }
+                Some(CleanItem::Card(index)) => {
+                    let card = &self.cards[index];
+                    if card.card_type == "section-review" {
+                        self.db.archive_section(&card.section_uid)?;
+                    } else {
+                        self.db.archive_quiz(card.id)?;
+                    }
+                    format!("archived {}", card.label)
+                }
+                Some(CleanItem::Image(_)) => {
+                    self.status = "images cannot be archived; d permanently deletes them".into();
+                    return Ok(());
+                }
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        };
+        self.refresh_index()?;
+        self.selected = self.selected.min(
+            match self.page {
+                Page::Dashboard => self.dashboard_items().len(),
+                Page::Reviews => self.review_items().len(),
+                Page::Clean => self.clean_items().len(),
+                _ => 0,
+            }
+            .saturating_sub(1),
+        );
+        self.status = status;
+        Ok(())
+    }
+
+    fn restore_selected(&mut self) -> Result<()> {
+        let Some(item) = self.archived.get(self.selected).cloned() else {
+            return Ok(());
+        };
+        let label = archived_item_label(&item);
+        self.db.restore(&item)?;
+        self.refresh_index()?;
+        self.selected = self.selected.min(self.archived.len().saturating_sub(1));
+        self.status = format!("restored {label}");
         Ok(())
     }
 
@@ -1151,6 +1247,23 @@ impl App {
                     self.update_vault_input_status();
                 }
             }
+            Page::Archived => {
+                if let Some(item) = self.archived.get(self.selected).cloned() {
+                    match item {
+                        ArchivedItem::Note { path, .. } => {
+                            self.open_editor(terminal, &self.vault.join(path), 1)?;
+                        }
+                        ArchivedItem::Section {
+                            path, start_line, ..
+                        } => {
+                            self.open_editor(terminal, &self.vault.join(path), start_line)?;
+                        }
+                        ArchivedItem::Quiz { .. } | ArchivedItem::Deck { .. } => {
+                            self.status = "restore this item with u before opening it".into();
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1255,6 +1368,8 @@ impl App {
             page_tab(" 5 Clean ", self.page == Page::Clean),
             Span::raw("  "),
             page_tab(" 6 Options ", self.page == Page::Options),
+            Span::raw("  "),
+            page_tab(" 7 Archived ", self.page == Page::Archived),
         ]);
         frame.render_widget(Paragraph::new(tabs), areas[0]);
         match self.mode {
@@ -1267,6 +1382,7 @@ impl App {
                 Page::Statistics => self.draw_statistics(frame, areas[1]),
                 Page::Clean => self.draw_clean(frame, areas[1]),
                 Page::Options => self.draw_options(frame, areas[1]),
+                Page::Archived => self.draw_archived(frame, areas[1]),
             },
         }
         frame.render_widget(
@@ -1719,6 +1835,122 @@ impl App {
                 ],
             ),
         };
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(focused_block(title, self.focused_panel == 1))
+                .wrap(Wrap { trim: false }),
+            columns[1],
+        );
+    }
+
+    fn draw_archived(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(area);
+        let items = self
+            .archived
+            .iter()
+            .map(|item| {
+                let (kind, label) = match item {
+                    ArchivedItem::Note { title, .. } => ("NOTE", title.as_str()),
+                    ArchivedItem::Section { heading, .. } => ("SECTION", heading.as_str()),
+                    ArchivedItem::Quiz { label, .. } => ("QUIZ", label.as_str()),
+                    ArchivedItem::Deck { name, .. } => ("DECK", name.as_str()),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {kind:<8}"), Style::default().fg(Color::DarkGray)),
+                    Span::raw(label.to_string()),
+                ]))
+            })
+            .collect::<Vec<_>>();
+        let mut state = ListState::default()
+            .with_selected((!self.archived.is_empty()).then_some(self.selected));
+        frame.render_stateful_widget(
+            List::new(if items.is_empty() {
+                vec![ListItem::new(dim_line("Nothing is archived"))]
+            } else {
+                items
+            })
+            .block(focused_block(" Archived items ", self.focused_panel == 0))
+            .highlight_style(selected_style())
+            .highlight_symbol("> "),
+            columns[0],
+            &mut state,
+        );
+
+        let (title, lines) = self.archived.get(self.selected).map_or_else(
+            || {
+                (
+                    " Archive ".to_string(),
+                    vec![
+                        Line::styled("The archive is empty.", Style::default().fg(Color::Green)),
+                        Line::raw(""),
+                        Line::raw("Press x on Dashboard, Reviews, or Clean to archive an item."),
+                    ],
+                )
+            },
+            |item| match item {
+                ArchivedItem::Note {
+                    title,
+                    path,
+                    section_count,
+                    quiz_count,
+                    ..
+                } => (
+                    format!(" Note: {title} "),
+                    vec![
+                        Line::raw(path.display().to_string()),
+                        Line::raw(""),
+                        Line::raw(format!("{section_count} sections  {quiz_count} quizzes")),
+                        Line::raw(""),
+                        Line::raw("Its sections and quizzes are hidden with the note."),
+                        dim_line("u restore note and contents   Enter open source"),
+                    ],
+                ),
+                ArchivedItem::Section {
+                    note_title,
+                    heading,
+                    path,
+                    quiz_count,
+                    ..
+                } => (
+                    format!(" Section: {heading} "),
+                    vec![
+                        Line::raw(format!("{note_title}  /  {}", path.display())),
+                        Line::raw(""),
+                        Line::raw(format!("{quiz_count} quizzes hidden with this section")),
+                        Line::raw(""),
+                        dim_line("u restore section and quizzes   Enter open source"),
+                    ],
+                ),
+                ArchivedItem::Quiz {
+                    label, card_count, ..
+                } => (
+                    " Archived quiz ".into(),
+                    vec![
+                        Line::raw(label.clone()),
+                        Line::raw(""),
+                        Line::raw(format!("{card_count} card variants retained")),
+                        Line::raw(""),
+                        dim_line("u restore quiz"),
+                    ],
+                ),
+                ArchivedItem::Deck {
+                    name, quiz_count, ..
+                } => (
+                    format!(" Deck: {name} "),
+                    vec![
+                        Line::raw(format!("{quiz_count} quizzes assigned")),
+                        Line::raw(""),
+                        Line::raw("Quizzes exclusive to this deck are hidden from active views."),
+                        Line::raw("Quizzes shared with an active deck remain active."),
+                        Line::raw(""),
+                        dim_line("u restore deck and its exclusive quizzes"),
+                    ],
+                ),
+            },
+        );
         frame.render_widget(
             Paragraph::new(lines)
                 .block(focused_block(title, self.focused_panel == 1))
@@ -2209,6 +2441,15 @@ impl App {
                 .wrap(Wrap { trim: false }),
             centered_card(area, 100, height),
         );
+    }
+}
+
+fn archived_item_label(item: &ArchivedItem) -> String {
+    match item {
+        ArchivedItem::Note { title, .. } => format!("note {title}"),
+        ArchivedItem::Section { heading, .. } => format!("section {heading}"),
+        ArchivedItem::Quiz { label, .. } => format!("quiz {label}"),
+        ArchivedItem::Deck { name, .. } => format!("deck {name}"),
     }
 }
 
@@ -2833,6 +3074,7 @@ mod tests {
             Page::Statistics,
             Page::Clean,
             Page::Options,
+            Page::Archived,
         ] {
             app.page = page;
             terminal.draw(|frame| app.draw(frame)).unwrap();

@@ -9,8 +9,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::config::ReviewOrder;
 use crate::model::{
-    CardContent, CardRow, DeckRow, Diagnostic, NoteRow, ParsedNote, RelationRow, ReviewCard,
-    ReviewSectionRow, SectionRow, Statistics,
+    ArchivedItem, CardContent, CardRow, DeckRow, Diagnostic, NoteRow, ParsedNote, RelationRow,
+    ReviewCard, ReviewSectionRow, SectionRow, Statistics,
 };
 use crate::parser::{markdown_files, parse_note};
 
@@ -122,6 +122,10 @@ impl Database {
             "created_at",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
+        add_column(&connection, "files", "archived_at", "INTEGER")?;
+        add_column(&connection, "sections", "archived_at", "INTEGER")?;
+        add_column(&connection, "cards", "archived_at", "INTEGER")?;
+        add_column(&connection, "decks", "archived_at", "INTEGER")?;
         connection.execute(
             "UPDATE files SET created_at=modified_at WHERE created_at=0",
             [],
@@ -370,6 +374,7 @@ impl Database {
         self.query_sections(
             "SELECT s.section_uid, f.title, s.heading, s.body, f.path, s.start_line
              FROM sections s JOIN files f ON f.id=s.file_id
+             WHERE f.archived_at IS NULL AND s.archived_at IS NULL
              ORDER BY lower(f.title), s.position",
             [],
         )
@@ -378,7 +383,8 @@ impl Database {
     pub fn notes(&self) -> Result<Vec<NoteRow>> {
         let mut statement = self.connection.prepare(
             "SELECT title, topic, pinned, created_at, modified_at, path
-             FROM files ORDER BY lower(COALESCE(topic, '')), lower(title)",
+             FROM files WHERE archived_at IS NULL
+             ORDER BY lower(COALESCE(topic, '')), lower(title)",
         )?;
         Ok(statement
             .query_map([], |row| {
@@ -400,6 +406,7 @@ impl Database {
                     EXISTS(SELECT 1 FROM cards c WHERE c.section_uid=s.section_uid
                            AND c.card_type='section-review' AND c.suspended=0)
              FROM sections s JOIN files f ON f.id=s.file_id
+             WHERE f.archived_at IS NULL AND s.archived_at IS NULL
              ORDER BY lower(f.title), s.position",
         )?;
         Ok(statement
@@ -459,8 +466,13 @@ impl Database {
 
     pub fn decks(&self) -> Result<Vec<DeckRow>> {
         let mut statement = self.connection.prepare(
-            "SELECT d.id, d.name, COUNT(cd.card_id) FROM decks d
-             LEFT JOIN card_decks cd ON cd.deck_id=d.id GROUP BY d.id ORDER BY lower(d.name)",
+            "SELECT d.id, d.name, COUNT(CASE WHEN c.archived_at IS NULL
+                    AND s.archived_at IS NULL AND f.archived_at IS NULL THEN 1 END)
+             FROM decks d LEFT JOIN card_decks cd ON cd.deck_id=d.id
+             LEFT JOIN cards c ON c.id=cd.card_id
+             LEFT JOIN sections s ON s.section_uid=c.section_uid
+             LEFT JOIN files f ON f.id=s.file_id
+             WHERE d.archived_at IS NULL GROUP BY d.id ORDER BY lower(d.name)",
         )?;
         Ok(statement
             .query_map([], |row| {
@@ -481,19 +493,172 @@ impl Database {
         Ok(())
     }
 
-    pub fn delete_deck(&self, id: i64) -> Result<()> {
-        self.connection
-            .execute("DELETE FROM decks WHERE id=?1", [id])?;
+    pub fn archive_note(&self, path: &Path) -> Result<()> {
+        self.connection.execute(
+            "UPDATE files SET archived_at=?2 WHERE path=?1",
+            params![path.to_string_lossy(), Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_section(&self, uid: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE sections SET archived_at=?2 WHERE section_uid=?1",
+            params![uid, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_quiz(&self, card_id: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE cards SET archived_at=?2
+             WHERE (section_uid, quiz_id)=(SELECT section_uid, quiz_id FROM cards WHERE id=?1)",
+            params![card_id, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_deck(&self, id: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE decks SET archived_at=?2 WHERE id=?1",
+            params![id, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn archived_items(&self) -> Result<Vec<ArchivedItem>> {
+        let mut items = Vec::new();
+        let mut statement = self.connection.prepare(
+            "SELECT f.note_id, f.title, f.path, COUNT(DISTINCT s.id),
+                    COUNT(DISTINCT CASE WHEN c.card_type!='section-review'
+                                       THEN c.section_uid || char(0) || c.quiz_id END)
+             FROM files f LEFT JOIN sections s ON s.file_id=f.id
+             LEFT JOIN cards c ON c.section_uid=s.section_uid
+             WHERE f.archived_at IS NOT NULL GROUP BY f.id ORDER BY f.archived_at DESC",
+        )?;
+        items.extend(
+            statement
+                .query_map([], |row| {
+                    Ok(ArchivedItem::Note {
+                        note_id: row.get(0)?,
+                        title: row.get(1)?,
+                        path: PathBuf::from(row.get::<_, String>(2)?),
+                        section_count: row.get(3)?,
+                        quiz_count: row.get(4)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        let mut statement = self.connection.prepare(
+            "SELECT s.section_uid, f.title, s.heading, f.path, s.start_line,
+                    COUNT(DISTINCT CASE WHEN c.card_type!='section-review' THEN c.quiz_id END)
+             FROM sections s JOIN files f ON f.id=s.file_id
+             LEFT JOIN cards c ON c.section_uid=s.section_uid
+             WHERE s.archived_at IS NOT NULL AND f.archived_at IS NULL
+             GROUP BY s.id ORDER BY s.archived_at DESC",
+        )?;
+        items.extend(
+            statement
+                .query_map([], |row| {
+                    Ok(ArchivedItem::Section {
+                        uid: row.get(0)?,
+                        note_title: row.get(1)?,
+                        heading: row.get(2)?,
+                        path: PathBuf::from(row.get::<_, String>(3)?),
+                        start_line: row.get(4)?,
+                        quiz_count: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        let mut statement = self.connection.prepare(
+            "SELECT c.section_uid, c.quiz_id,
+                    f.title || ' / ' || s.heading || ' / ' || c.quiz_id, COUNT(*)
+             FROM cards c JOIN sections s ON s.section_uid=c.section_uid
+             JOIN files f ON f.id=s.file_id
+             WHERE c.archived_at IS NOT NULL AND c.card_type!='section-review'
+               AND s.archived_at IS NULL AND f.archived_at IS NULL
+             GROUP BY c.section_uid, c.quiz_id ORDER BY MAX(c.archived_at) DESC",
+        )?;
+        items.extend(
+            statement
+                .query_map([], |row| {
+                    Ok(ArchivedItem::Quiz {
+                        section_uid: row.get(0)?,
+                        quiz_id: row.get(1)?,
+                        label: row.get(2)?,
+                        card_count: row.get(3)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        let mut statement = self.connection.prepare(
+            "SELECT d.id, d.name, COUNT(DISTINCT c.section_uid || char(0) || c.quiz_id)
+             FROM decks d LEFT JOIN card_decks cd ON cd.deck_id=d.id
+             LEFT JOIN cards c ON c.id=cd.card_id AND c.card_type!='section-review'
+             WHERE d.archived_at IS NOT NULL GROUP BY d.id ORDER BY d.archived_at DESC",
+        )?;
+        items.extend(
+            statement
+                .query_map([], |row| {
+                    Ok(ArchivedItem::Deck {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        quiz_count: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        );
+        Ok(items)
+    }
+
+    pub fn restore(&self, item: &ArchivedItem) -> Result<()> {
+        match item {
+            ArchivedItem::Note { note_id, .. } => {
+                self.connection.execute(
+                    "UPDATE files SET archived_at=NULL WHERE note_id=?1",
+                    [note_id],
+                )?;
+            }
+            ArchivedItem::Section { uid, .. } => {
+                self.connection.execute(
+                    "UPDATE sections SET archived_at=NULL WHERE section_uid=?1",
+                    [uid],
+                )?;
+            }
+            ArchivedItem::Quiz {
+                section_uid,
+                quiz_id,
+                ..
+            } => {
+                self.connection.execute(
+                    "UPDATE cards SET archived_at=NULL WHERE section_uid=?1 AND quiz_id=?2",
+                    params![section_uid, quiz_id],
+                )?;
+            }
+            ArchivedItem::Deck { id, .. } => {
+                self.connection
+                    .execute("UPDATE decks SET archived_at=NULL WHERE id=?1", [id])?;
+            }
+        }
         Ok(())
     }
 
     pub fn card_rows(&self) -> Result<Vec<CardRow>> {
         let mut statement = self.connection.prepare(
             "SELECT c.id, f.title || ' / ' || s.heading || ' / ' || c.quiz_id,
-                    COALESCE(group_concat(cd.deck_id), '')
+                    COALESCE(group_concat(CASE WHEN d.archived_at IS NULL THEN d.id END), ''),
+                    c.section_uid, c.card_type
              FROM cards c JOIN sections s ON s.section_uid=c.section_uid
              JOIN files f ON f.id=s.file_id LEFT JOIN card_decks cd ON cd.card_id=c.id
-             WHERE c.suspended=0 GROUP BY c.id ORDER BY lower(f.title), s.position, c.id",
+             LEFT JOIN decks d ON d.id=cd.deck_id
+             WHERE c.suspended=0 AND c.archived_at IS NULL AND s.archived_at IS NULL
+               AND f.archived_at IS NULL
+               AND (NOT EXISTS(SELECT 1 FROM card_decks any_cd WHERE any_cd.card_id=c.id)
+                    OR EXISTS(SELECT 1 FROM card_decks active_cd JOIN decks active_d
+                              ON active_d.id=active_cd.deck_id
+                              WHERE active_cd.card_id=c.id AND active_d.archived_at IS NULL))
+             GROUP BY c.id ORDER BY lower(f.title), s.position, c.id",
         )?;
         Ok(statement
             .query_map([], |row| {
@@ -505,6 +670,8 @@ impl Database {
                         .split(',')
                         .filter_map(|value| value.parse().ok())
                         .collect(),
+                    section_uid: row.get(3)?,
+                    card_type: row.get(4)?,
                 })
             })?
             .collect::<rusqlite::Result<_>>()?)
@@ -551,47 +718,88 @@ impl Database {
         let (note_count, topic_count, untopiced_count) = self.connection.query_row(
             "SELECT COUNT(*), COUNT(DISTINCT topic),
                     COALESCE(SUM(CASE WHEN topic IS NULL OR trim(topic)='' THEN 1 ELSE 0 END), 0)
-             FROM files",
+             FROM files WHERE archived_at IS NULL",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let card_count = count(
             &self.connection,
-            "SELECT COUNT(*) FROM cards WHERE suspended=0",
+            "SELECT COUNT(*) FROM cards c JOIN sections s ON s.section_uid=c.section_uid
+             JOIN files f ON f.id=s.file_id WHERE c.suspended=0 AND c.archived_at IS NULL
+             AND s.archived_at IS NULL AND f.archived_at IS NULL
+             AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                  OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                            WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
             [],
         )?;
         let due_now = count(
             &self.connection,
             "SELECT COUNT(*) FROM review_state rs JOIN cards c ON c.id=rs.card_id
-             WHERE c.suspended=0 AND rs.due_at<=?1",
+             JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+             WHERE c.suspended=0 AND c.archived_at IS NULL AND s.archived_at IS NULL
+               AND f.archived_at IS NULL AND rs.due_at<=?1
+               AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                    OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                              WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
             [now],
         )?;
         let reviewed_today = count(
             &self.connection,
-            "SELECT COUNT(*) FROM review_log WHERE reviewed_at>=?1",
+            "SELECT COUNT(*) FROM review_log l JOIN cards c ON c.id=l.card_id
+             JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+             WHERE l.reviewed_at>=?1 AND c.archived_at IS NULL AND s.archived_at IS NULL
+               AND f.archived_at IS NULL
+               AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                    OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                              WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
             [day_start],
         )?;
         let reviewed_week = count(
             &self.connection,
-            "SELECT COUNT(*) FROM review_log WHERE reviewed_at>=?1",
+            "SELECT COUNT(*) FROM review_log l JOIN cards c ON c.id=l.card_id
+             JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+             WHERE l.reviewed_at>=?1 AND c.archived_at IS NULL AND s.archived_at IS NULL
+               AND f.archived_at IS NULL
+               AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                    OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                              WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
             [week_start],
         )?;
         let accuracy = |start| -> Result<Option<f64>> {
             Ok(self.connection.query_row(
                 "SELECT AVG(CASE WHEN COALESCE(answer_correct, rating>1) THEN 1.0 ELSE 0.0 END)
-                 FROM review_log WHERE reviewed_at>=?1",
+                 FROM review_log l JOIN cards c ON c.id=l.card_id
+                 JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+                 WHERE reviewed_at>=?1 AND c.archived_at IS NULL AND s.archived_at IS NULL
+                   AND f.archived_at IS NULL
+                   AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                        OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                                  WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
                 [start],
                 |row| row.get(0),
             )?)
         };
         let average_response_ms = self.connection.query_row(
-            "SELECT CAST(AVG(response_ms) AS INTEGER) FROM review_log WHERE reviewed_at>=?1",
+            "SELECT CAST(AVG(response_ms) AS INTEGER) FROM review_log l
+             JOIN cards c ON c.id=l.card_id JOIN sections s ON s.section_uid=c.section_uid
+             JOIN files f ON f.id=s.file_id WHERE reviewed_at>=?1 AND c.archived_at IS NULL
+             AND s.archived_at IS NULL AND f.archived_at IS NULL
+             AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                  OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                            WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
             [week_start],
             |row| row.get(0),
         )?;
         let mut rating_counts = [0; 4];
         let mut statement = self.connection.prepare(
-            "SELECT rating, COUNT(*) FROM review_log WHERE reviewed_at>=?1 GROUP BY rating",
+            "SELECT rating, COUNT(*) FROM review_log l JOIN cards c ON c.id=l.card_id
+             JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+             WHERE reviewed_at>=?1 AND c.archived_at IS NULL AND s.archived_at IS NULL
+             AND f.archived_at IS NULL
+             AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                  OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                            WHERE cd.card_id=c.id AND d.archived_at IS NULL))
+             GROUP BY rating",
         )?;
         for row in statement.query_map([month_start], |row| {
             Ok((row.get::<_, usize>(0)?, row.get::<_, usize>(1)?))
@@ -608,7 +816,13 @@ impl Database {
                 start,
                 count(
                     &self.connection,
-                    "SELECT COUNT(*) FROM review_log WHERE reviewed_at>=?1 AND reviewed_at<?2",
+                    "SELECT COUNT(*) FROM review_log l JOIN cards c ON c.id=l.card_id
+                     JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+                     WHERE reviewed_at>=?1 AND reviewed_at<?2 AND c.archived_at IS NULL
+                     AND s.archived_at IS NULL AND f.archived_at IS NULL
+                     AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                          OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                                    WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
                     params![start, start + 86_400],
                 )?,
             ));
@@ -618,7 +832,13 @@ impl Database {
             let start = day_start - i64::from(offset) * 86_400;
             if count(
                 &self.connection,
-                "SELECT COUNT(*) FROM review_log WHERE reviewed_at>=?1 AND reviewed_at<?2",
+                "SELECT COUNT(*) FROM review_log l JOIN cards c ON c.id=l.card_id
+                 JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+                 WHERE reviewed_at>=?1 AND reviewed_at<?2 AND c.archived_at IS NULL
+                 AND s.archived_at IS NULL AND f.archived_at IS NULL
+                 AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                      OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                                WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
                 params![start, start + 86_400],
             )? == 0
             {
@@ -634,7 +854,12 @@ impl Database {
                 count(
                     &self.connection,
                     "SELECT COUNT(*) FROM review_state rs JOIN cards c ON c.id=rs.card_id
-                     WHERE c.suspended=0 AND rs.due_at>=?1 AND rs.due_at<?2",
+                     JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+                     WHERE c.suspended=0 AND c.archived_at IS NULL AND s.archived_at IS NULL
+                     AND f.archived_at IS NULL AND rs.due_at>=?1 AND rs.due_at<?2
+                     AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                          OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                                    WHERE cd.card_id=c.id AND d.archived_at IS NULL))",
                     params![start, start + 86_400],
                 )?,
             ));
@@ -643,8 +868,13 @@ impl Database {
             "SELECT f.title, COUNT(*),
                     AVG(CASE WHEN COALESCE(l.answer_correct, l.rating>1) THEN 1.0 ELSE 0.0 END) score
              FROM review_log l JOIN cards c ON c.id=l.card_id
-             JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
-             WHERE l.reviewed_at>=?1 GROUP BY f.id HAVING COUNT(*)>=2
+              JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+              WHERE l.reviewed_at>=?1 AND c.archived_at IS NULL AND s.archived_at IS NULL
+                AND f.archived_at IS NULL
+                AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                     OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                               WHERE cd.card_id=c.id AND d.archived_at IS NULL))
+              GROUP BY f.id HAVING COUNT(*)>=2
              ORDER BY score, COUNT(*) DESC LIMIT 5",
         )?;
         let weak_notes = statement
@@ -684,7 +914,8 @@ impl Database {
             "SELECT s.section_uid, f.title, s.heading, s.body, f.path, s.start_line
              FROM section_search q
              JOIN sections s ON s.id=q.rowid JOIN files f ON f.id=s.file_id
-             WHERE section_search MATCH ?1 ORDER BY bm25(section_search, 0, 2, 5, 1, 1) LIMIT 100",
+             WHERE section_search MATCH ?1 AND s.archived_at IS NULL AND f.archived_at IS NULL
+             ORDER BY bm25(section_search, 0, 2, 5, 1, 1) LIMIT 100",
         )?;
         Ok(statement
             .query_map([fts_query], section_from_row)?
@@ -706,11 +937,21 @@ impl Database {
             "SELECT r.relation_type, r.target_section_uid, target.heading, 0
              FROM relations r JOIN sections source ON source.id=r.source_section_id
              LEFT JOIN sections target ON target.section_uid=r.target_section_uid
-             WHERE source.section_uid=?1
+             JOIN files source_file ON source_file.id=source.file_id
+             LEFT JOIN files target_file ON target_file.id=target.file_id
+             WHERE source.section_uid=?1 AND source.archived_at IS NULL
+               AND source_file.archived_at IS NULL
+               AND (target.id IS NULL OR (target.archived_at IS NULL
+                                          AND target_file.archived_at IS NULL))
              UNION ALL
              SELECT r.relation_type, source.section_uid, source.heading, 1
              FROM relations r JOIN sections source ON source.id=r.source_section_id
-             WHERE r.target_section_uid=?1",
+             JOIN files source_file ON source_file.id=source.file_id
+             JOIN sections target ON target.section_uid=r.target_section_uid
+             JOIN files target_file ON target_file.id=target.file_id
+             WHERE r.target_section_uid=?1 AND source.archived_at IS NULL
+               AND source_file.archived_at IS NULL AND target.archived_at IS NULL
+               AND target_file.archived_at IS NULL",
         )?;
         Ok(statement
             .query_map([section_uid], |row| {
@@ -754,7 +995,13 @@ impl Database {
             "SELECT c.id, c.card_uid, c.section_uid, c.definition, rs.due_at,
                     rs.stability, rs.difficulty, rs.last_review_at, rs.review_count
              FROM cards c JOIN review_state rs ON rs.card_id=c.id
-             WHERE c.suspended=0 AND rs.due_at <= ?1 ORDER BY rs.due_at, c.id",
+             JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
+             WHERE c.suspended=0 AND c.archived_at IS NULL AND s.archived_at IS NULL
+               AND f.archived_at IS NULL AND rs.due_at <= ?1
+               AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                    OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                              WHERE cd.card_id=c.id AND d.archived_at IS NULL))
+             ORDER BY rs.due_at, c.id",
         )?;
         let mut cards = statement
             .query_map([now], |row| {
@@ -877,9 +1124,12 @@ impl Database {
     }
 
     pub fn diagnostics(&self) -> Result<Vec<Diagnostic>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT path, line, message FROM diagnostics ORDER BY path, line")?;
+        let mut statement = self.connection.prepare(
+            "SELECT d.path, d.line, d.message FROM diagnostics d
+             WHERE NOT EXISTS(SELECT 1 FROM files f
+                              WHERE f.path=d.path AND f.archived_at IS NOT NULL)
+             ORDER BY d.path, d.line",
+        )?;
         Ok(statement
             .query_map([], |row| {
                 Ok(Diagnostic {
@@ -1133,6 +1383,104 @@ prompt: One {{c1::writer}}.
             db.record_review(&card, 3, Some(true), 100, None, 0.9)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn archives_notes_sections_and_quizzes_across_reindexing() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("test.md"),
+            "---\nid: test\ntitle: Test\n---\n# Root {#root}\n\n```quiz\nid: q1\ntype: cloze\nprompt: '{{c1::answer}}'\n```\n\n## Child {#child}\nBody\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        db.archive_section("test#child").unwrap();
+        assert!(
+            db.sections()
+                .unwrap()
+                .iter()
+                .all(|row| row.uid != "test#child")
+        );
+        let child = db
+            .archived_items()
+            .unwrap()
+            .into_iter()
+            .find(|item| matches!(item, ArchivedItem::Section { uid, .. } if uid == "test#child"))
+            .unwrap();
+        db.restore(&child).unwrap();
+        assert!(
+            db.sections()
+                .unwrap()
+                .iter()
+                .any(|row| row.uid == "test#child")
+        );
+
+        let card = db.card_rows().unwrap().remove(0);
+        db.archive_quiz(card.id).unwrap();
+        assert!(db.card_rows().unwrap().is_empty());
+        assert_eq!(db.statistics().unwrap().card_count, 0);
+        let quiz = db
+            .archived_items()
+            .unwrap()
+            .into_iter()
+            .find(|item| matches!(item, ArchivedItem::Quiz { quiz_id, .. } if quiz_id == "q1"))
+            .unwrap();
+        db.restore(&quiz).unwrap();
+        assert_eq!(db.statistics().unwrap().card_count, 1);
+
+        db.archive_note(Path::new("test.md")).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert!(db.notes().unwrap().is_empty());
+        assert!(db.sections().unwrap().is_empty());
+        assert!(db.card_rows().unwrap().is_empty());
+        assert_eq!(db.statistics().unwrap().note_count, 0);
+        let note = db.archived_items().unwrap().remove(0);
+        assert!(matches!(note, ArchivedItem::Note { .. }));
+        db.restore(&note).unwrap();
+        assert_eq!(db.notes().unwrap().len(), 1);
+        assert_eq!(db.card_rows().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archived_decks_hide_exclusive_quizzes_until_restored() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("test.md"),
+            "# Test {#root}\n\n```quiz\nid: q1\ntype: cloze\nprompt: '{{c1::answer}}'\n```\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        db.create_deck("Old").unwrap();
+        let deck = db.decks().unwrap().remove(0);
+        let card = db.card_rows().unwrap().remove(0);
+        db.toggle_card_deck(card.id, deck.id).unwrap();
+
+        db.archive_deck(deck.id).unwrap();
+        assert!(db.decks().unwrap().is_empty());
+        assert!(db.card_rows().unwrap().is_empty());
+        assert!(
+            db.due_cards(20, 200, ReviewOrder::Due, false)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.statistics().unwrap().card_count, 0);
+        let archived = db.archived_items().unwrap();
+        let deck = archived
+            .iter()
+            .find(|item| matches!(item, ArchivedItem::Deck { .. }))
+            .unwrap();
+        db.restore(deck).unwrap();
+        assert_eq!(db.decks().unwrap().len(), 1);
+        assert_eq!(db.card_rows().unwrap().len(), 1);
+        assert_eq!(
+            db.due_cards(20, 200, ReviewOrder::Due, false)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

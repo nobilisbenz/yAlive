@@ -30,13 +30,14 @@ yalive --vault ~/Notes editor diagnostics
 
 | Mode | Keys |
 | --- | --- |
-| Pages | `1` dashboard, `2` reviews, `3` relations, `4` statistics, `5` cleanup, `6` options |
+| Pages | `1` dashboard, `2` reviews, `3` relations, `4` statistics, `5` cleanup, `6` options, `7` archived |
 | Panel focus | `Shift+h` left, `Shift+l` right, `Shift+j` down, `Shift+k` up |
 | Dashboard | `Enter` opens a note/section, `n` creates a note, `/` searches |
 | Dashboard | `g` or `b` relations/backlinks, `o` opens URL, `i` opens image |
+| Archive | `x` archives the selected note, section, quiz, or deck; `u` restores it on the archived page |
 | Review setup | `Enter` opens notes/sections, activates decks, or reviews cards |
 | Review setup | `Space` enrolls a section, `r` reviews due cards, `n` creates a deck |
-| Review setup | `[`/`]` choose active deck, `a` assign card, `x` delete active deck |
+| Review setup | `[`/`]` choose active deck, `a` assign card, `x` archive selected item |
 | Refresh | `Shift+r` reloads Markdown and SQLite-backed lists immediately |
 | Relations | `j/k` selects in the focused panel, `Enter` follows incoming/outgoing links or opens the center section |
 | Cleanup | `Enter` opens an item, `a` assigns a card, `d` deletes an unreferenced image |
@@ -95,4 +96,4 @@ Review submissions are not stored. Ratings, correctness, response time, FSRS mem
 - Search results and review cards target stable sections, not only files.
 - Moving a file or renaming a heading preserves identity when its IDs stay unchanged.
 - Reindexing preserves review state for unchanged card UIDs.
-- The index can be rebuilt from Markdown; review history, decks, and deck assignments are the non-derived SQLite data worth backing up.
+- The index can be rebuilt from Markdown; review history, decks, deck assignments, and archive state are the non-derived SQLite data worth backing up.
