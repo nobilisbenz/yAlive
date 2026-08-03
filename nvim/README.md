@@ -6,9 +6,9 @@ Neovim integration for yalive vaults. Markdown remains the source of truth; the 
 
 - Neovim 0.10 or newer
 - `yalive` installed in `$PATH`, for example with `cargo install --path /path/to/yalive`
-- Optional: [`fzf-lua`](https://github.com/ibhagwan/fzf-lua) or [`fzf.vim`](https://github.com/junegunn/fzf.vim)
+- Optional: [Telescope](https://github.com/nvim-telescope/telescope.nvim), [`fzf-lua`](https://github.com/ibhagwan/fzf-lua), or [`fzf.vim`](https://github.com/junegunn/fzf.vim)
 
-Pickers prefer `fzf-lua`, then `fzf.vim`, and otherwise use `vim.ui.select`.
+Pickers prefer Telescope, then `fzf-lua`, then `fzf.vim`, and otherwise use `vim.ui.select`.
 
 ## Install
 

@@ -39,9 +39,19 @@ local function current_vault()
 end
 
 local function command(vault, args)
+  if vim.fn.executable(config.executable) ~= 1 then
+    notify("Executable not found: " .. config.executable, vim.log.levels.ERROR)
+    return nil
+  end
+
   local argv = { config.executable, "--vault", vault }
   vim.list_extend(argv, args)
-  local result = vim.system(argv, { text = true }):wait()
+  local ok, process = pcall(vim.system, argv, { text = true })
+  if not ok then
+    notify("Failed to start " .. config.executable .. ": " .. tostring(process), vim.log.levels.ERROR)
+    return nil
+  end
+  local result = process:wait()
   if result.code ~= 0 then
     notify(vim.trim(result.stderr ~= "" and result.stderr or result.stdout), vim.log.levels.ERROR)
     return nil
@@ -69,6 +79,37 @@ local function pick(items, label, format, callback)
     notify("No " .. label:lower() .. " found")
     return
   end
+
+  local telescope_ok, pickers = pcall(require, "telescope.pickers")
+  if telescope_ok then
+    local finders = require("telescope.finders")
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+    local conf = require("telescope.config").values
+    pickers.new({}, {
+      prompt_title = label,
+      finder = finders.new_table({
+        results = items,
+        entry_maker = function(item)
+          local text = format(item)
+          return { value = item, display = text, ordinal = text }
+        end,
+      }),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr)
+        actions.select_default:replace(function()
+          local selection = action_state.get_selected_entry()
+          actions.close(prompt_bufnr)
+          if selection then
+            vim.schedule(function() callback(selection.value) end)
+          end
+        end)
+        return true
+      end,
+    }):find()
+    return
+  end
+
   local labels, lookup = {}, {}
   for index, item in ipairs(items) do
     local text = format(item)
