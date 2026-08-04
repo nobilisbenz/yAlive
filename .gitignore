@@ -1,4 +1,7 @@
 /target/
+/ygraphy/target/
 **/.notes/*.sqlite
 **/.notes/*.sqlite-shm
 **/.notes/*.sqlite-wal
+**/.notes/ygraphy-open.json
+**/.notes/ygraphy-open.pending

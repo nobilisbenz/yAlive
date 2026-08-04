@@ -240,6 +240,7 @@ impl App {
             {
                 return Ok(self.next_vault.take());
             }
+            self.consume_ygraphy_command()?;
             if self.last_index.elapsed()
                 >= Duration::from_millis(self.config.reindex_interval_ms.max(200))
                 && self.mode != Mode::Review
@@ -275,6 +276,37 @@ impl App {
             Page::Archived => self.archived.len(),
         };
         self.selected = self.selected.min(total.saturating_sub(1));
+        Ok(())
+    }
+
+    fn consume_ygraphy_command(&mut self) -> Result<()> {
+        let path = self.vault.join(".notes/ygraphy-open.json");
+        if !path.exists() {
+            return Ok(());
+        }
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.status = format!("could not read ygraphy command: {error}");
+                return Ok(());
+            }
+        };
+        if let Err(error) = fs::remove_file(&path) {
+            self.status = format!("could not consume ygraphy command: {error}");
+            return Ok(());
+        }
+        let uid: String = match serde_json::from_str(&source) {
+            Ok(uid) => uid,
+            Err(error) => {
+                self.status = format!("ignored invalid ygraphy command: {error}");
+                return Ok(());
+            }
+        };
+        self.refresh_index()?;
+        self.mode = Mode::Browse;
+        self.page = Page::Relations;
+        self.focused_panel = 1;
+        self.follow_relation(&uid)?;
         Ok(())
     }
 
@@ -3109,6 +3141,30 @@ mod tests {
         app.follow_relation("beta#root").unwrap();
         assert_eq!(app.sections[app.relation_section].uid, "beta#root");
         assert_eq!(app.incoming_relations().len(), 1);
+    }
+
+    #[test]
+    fn consumes_ygraphy_focus_commands() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("welcome.md"),
+            "---\nid: welcome\ntitle: Welcome\n---\n# Welcome {#root}\n",
+        )
+        .unwrap();
+        let vault = dir.path().canonicalize().unwrap();
+        let database = Database::open(&vault).unwrap();
+        let mut app = App::new(vault.clone(), database).unwrap();
+        fs::write(
+            vault.join(".notes/ygraphy-open.json"),
+            serde_json::to_vec("welcome#root").unwrap(),
+        )
+        .unwrap();
+
+        app.consume_ygraphy_command().unwrap();
+
+        assert!(app.page == Page::Relations);
+        assert_eq!(app.sections[app.relation_section].uid, "welcome#root");
+        assert!(!vault.join(".notes/ygraphy-open.json").exists());
     }
 
     #[test]

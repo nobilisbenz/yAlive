@@ -1,9 +1,3 @@
-mod app;
-mod config;
-mod db;
-mod model;
-mod parser;
-
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -13,8 +7,9 @@ use clap::{Parser, Subcommand};
 use directories::{ProjectDirs, UserDirs};
 use serde_json::json;
 
-use crate::db::Database;
-use crate::model::{card_capabilities, relation_capabilities};
+use yalive::app;
+use yalive::db::Database;
+use yalive::model::{card_capabilities, relation_capabilities};
 
 #[derive(Parser)]
 #[command(version, about)]

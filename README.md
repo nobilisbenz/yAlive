@@ -17,6 +17,17 @@ cargo run -- --vault ~/Notes diagnostics
 cargo run -- --vault ~/Notes export-reviews
 ```
 
+### ygraphy
+
+`ygraphy/` is a native Rust/wgpu graph for the same vault. Sections are connected by their typed relations. Soft force constraints cluster sections inside notes and notes inside topics, while fitted circles make the `topic -> note -> section` hierarchy visible.
+
+```bash
+cd ygraphy
+cargo run --release -- --vault ../examples/vault
+```
+
+Omit `--vault` to use the vault most recently opened by `yalive`. Drag a section to reposition it, drag the canvas to pan, double-click a section to focus it in the running TUI, use the wheel to zoom, press `Space` to pause the simulation, `F` to fit, and `Esc` to exit.
+
 Machine-readable editor commands are also available. They are versioned JSON so editor plugins do not need to read the disposable SQLite schema:
 
 ```bash

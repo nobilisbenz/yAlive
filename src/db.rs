@@ -9,8 +9,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::config::ReviewOrder;
 use crate::model::{
-    ArchivedItem, CardContent, CardRow, DeckRow, Diagnostic, NoteRow, ParsedNote, RelationRow,
-    ReviewCard, ReviewSectionRow, SectionRow, Statistics,
+    ArchivedItem, CardContent, CardRow, DeckRow, Diagnostic, GraphData, GraphLink, GraphNote,
+    GraphSection, NoteRow, ParsedNote, RelationRow, ReviewCard, ReviewSectionRow, SectionRow,
+    Statistics,
 };
 use crate::parser::{markdown_files, parse_note};
 
@@ -23,6 +24,7 @@ impl Database {
         let notes_dir = vault.join(".notes");
         fs::create_dir_all(&notes_dir)?;
         let connection = Connection::open(notes_dir.join("index.sqlite"))?;
+        connection.busy_timeout(std::time::Duration::from_secs(3))?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
@@ -965,6 +967,73 @@ impl Database {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    pub fn graph(&self) -> Result<GraphData> {
+        let notes = {
+            let mut statement = self.connection.prepare(
+                "SELECT note_id, title, topic, path FROM files
+                 WHERE archived_at IS NULL ORDER BY lower(title)",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(GraphNote {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        topic: row.get(2)?,
+                        path: PathBuf::from(row.get::<_, String>(3)?),
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let sections = {
+            let mut statement = self.connection.prepare(
+                "SELECT s.section_uid, f.note_id, s.heading, s.parent_uid,
+                        s.heading_level, s.start_line
+                 FROM sections s JOIN files f ON f.id=s.file_id
+                 WHERE s.archived_at IS NULL AND f.archived_at IS NULL
+                 ORDER BY lower(f.title), s.position",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(GraphSection {
+                        uid: row.get(0)?,
+                        note_id: row.get(1)?,
+                        heading: row.get(2)?,
+                        parent_uid: row.get(3)?,
+                        level: row.get(4)?,
+                        start_line: row.get(5)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let links = {
+            let mut statement = self.connection.prepare(
+                "SELECT source.section_uid, target.section_uid, r.relation_type
+                 FROM relations r
+                 JOIN sections source ON source.id=r.source_section_id
+                 JOIN files source_file ON source_file.id=source.file_id
+                 JOIN sections target ON target.section_uid=r.target_section_uid
+                 JOIN files target_file ON target_file.id=target.file_id
+                 WHERE source.archived_at IS NULL AND target.archived_at IS NULL
+                   AND source_file.archived_at IS NULL AND target_file.archived_at IS NULL
+                 ORDER BY source.section_uid, target.section_uid, r.relation_type",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok(GraphLink {
+                        source: row.get(0)?,
+                        target: row.get(1)?,
+                        relation_type: row.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(GraphData {
+            notes,
+            sections,
+            links,
+        })
+    }
+
     pub fn due_cards(
         &self,
         new_cards_per_day: usize,
@@ -1357,6 +1426,38 @@ prompt: One {{c1::writer}}.
             &due_card.content,
             CardContent::Section { body, .. } if body.contains("Exclusive")
         )));
+    }
+
+    #[test]
+    fn builds_graph_with_note_section_and_typed_relation_data() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("alpha.md"),
+            "---\nid: alpha\ntitle: Alpha\ntopic: Systems\n---\n# Alpha {#root}\n\nsupports:: [[beta#root]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("beta.md"),
+            "---\nid: beta\ntitle: Beta\ntopic: Systems\n---\n# Beta {#root}\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        let graph = db.graph().unwrap();
+        assert_eq!(graph.notes.len(), 2);
+        assert_eq!(graph.sections.len(), 2);
+        assert!(
+            graph
+                .notes
+                .iter()
+                .all(|note| note.topic.as_deref() == Some("Systems"))
+        );
+        assert!(graph.links.iter().any(|link| {
+            link.source == "alpha#root"
+                && link.target == "beta#root"
+                && link.relation_type == "supports"
+        }));
     }
 
     #[test]

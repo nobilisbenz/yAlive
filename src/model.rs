@@ -232,6 +232,38 @@ pub struct RelationRow {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct GraphNote {
+    pub id: String,
+    pub title: String,
+    pub topic: Option<String>,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphSection {
+    pub uid: String,
+    pub note_id: String,
+    pub heading: String,
+    pub parent_uid: Option<String>,
+    pub level: u32,
+    pub start_line: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphLink {
+    pub source: String,
+    pub target: String,
+    pub relation_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphData {
+    pub notes: Vec<GraphNote>,
+    pub sections: Vec<GraphSection>,
+    pub links: Vec<GraphLink>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct CardCapability {
     pub card_type: &'static str,
     pub label: &'static str,
