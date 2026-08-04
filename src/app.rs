@@ -29,6 +29,7 @@ use crate::model::{
     ArchivedItem, CardContent, CardRow, ChoiceMode, DeckRow, GapDefinition, NoteRow, RelationRow,
     ReviewCard, ReviewSectionRow, SectionRow, Statistics,
 };
+use crate::sync;
 
 type Tui = Terminal<CrosstermBackend<Stdout>>;
 
@@ -39,6 +40,7 @@ enum Mode {
     DeckInput,
     NoteInput,
     VaultInput,
+    GitRemoteInput,
     Review,
 }
 
@@ -177,6 +179,7 @@ pub struct App {
     review: Option<ReviewSession>,
     create_vault: bool,
     next_vault: Option<PathBuf>,
+    sync_remote: Option<String>,
     status: String,
     last_index: Instant,
 }
@@ -193,6 +196,7 @@ impl App {
         let archived = db.archived_items()?;
         let orphan_images = find_orphan_images(&vault)?;
         let statistics = db.statistics()?;
+        let sync_remote = sync::remote(&vault);
         Ok(Self {
             vault,
             config,
@@ -219,6 +223,7 @@ impl App {
             review: None,
             create_vault: false,
             next_vault: None,
+            sync_remote,
             status: "[1] Dashboard  [2] Reviews  [3] Relations  [4] Statistics  [5] Clean  [6] Options  [7] Archived".into(),
             last_index: Instant::now(),
         })
@@ -272,7 +277,7 @@ impl App {
             Page::Relations => self.sections.len(),
             Page::Statistics => 1,
             Page::Clean => self.clean_items().len(),
-            Page::Options => 7,
+            Page::Options => 10,
             Page::Archived => self.archived.len(),
         };
         self.selected = self.selected.min(total.saturating_sub(1));
@@ -314,6 +319,10 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Ok(true);
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.sync_vault()?;
+            return Ok(false);
+        }
         if self.mode == Mode::Browse
             && let Some((dx, dy)) = shifted_panel_direction(key)
         {
@@ -329,6 +338,7 @@ impl App {
             Mode::DeckInput => self.handle_deck_input(key),
             Mode::NoteInput => self.handle_note_input(key, terminal),
             Mode::VaultInput => self.handle_vault_input(key),
+            Mode::GitRemoteInput => self.handle_git_remote_input(key),
             Mode::Review => self.handle_review(key),
         }
     }
@@ -577,6 +587,41 @@ impl App {
         Ok(false)
     }
 
+    fn handle_git_remote_input(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.query.clear();
+                self.set_page_status();
+            }
+            KeyCode::Enter if !self.query.trim().is_empty() => {
+                match sync::configure_remote(&self.vault, self.query.trim()) {
+                    Ok(()) => {
+                        self.sync_remote = sync::remote(&self.vault);
+                        self.status =
+                            "Git repository saved; select Sync now to upload the vault".into();
+                        self.mode = Mode::Browse;
+                    }
+                    Err(error) => self.status = format!("could not save repository: {error:#}"),
+                }
+            }
+            KeyCode::Backspace => {
+                self.query.pop();
+                self.update_git_remote_status();
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.query.push(character);
+                self.update_git_remote_status();
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn update_git_remote_status(&mut self) {
+        self.status = format!("Repository URL: {}  Enter save  Esc cancel", self.query);
+    }
+
     fn update_vault_input_status(&mut self) {
         self.status = format!(
             "{} vault path: {}  Enter confirm  Esc cancel",
@@ -763,7 +808,7 @@ impl App {
                     .min(total.saturating_sub(1));
             }
             Page::Options => {
-                self.selected = self.selected.saturating_add_signed(amount).min(6);
+                self.selected = self.selected.saturating_add_signed(amount).min(9);
             }
             Page::Archived => {
                 self.selected = self
@@ -946,23 +991,17 @@ impl App {
 
     fn set_page_status(&mut self) {
         self.status = match self.page {
-            Page::Dashboard => {
-                "[1-7] pages  Enter open  n new note  x archive  / search  S-h/l left/right"
-            }
+            Page::Dashboard => "[1-7] pages  Enter open  n new note  / search  Ctrl+s sync",
             Page::Reviews => {
-                "[1-7] pages  r review due  Space enroll  a assign  x archive  S-h/l left/right"
+                "[1-7] pages  r review due  Space enroll  a assign  x archive  Ctrl+s sync"
             }
-            Page::Relations => {
-                "[1-7] pages  j/k select  Enter follow/open  S-h/l left/right  S-j/k down/up"
-            }
-            Page::Statistics => "[1-7] pages  j/k scroll  S-h/l left/right  S-j/k down/up",
+            Page::Relations => "[1-7] pages  j/k select  Enter follow/open  Ctrl+s sync",
+            Page::Statistics => "[1-7] pages  j/k scroll  Ctrl+s sync",
             Page::Clean => {
-                "[1-7] pages  Enter open  a assign  x archive  d delete image  S-h/l left/right"
+                "[1-7] pages  Enter open  a assign  x archive  d delete image  Ctrl+s sync"
             }
-            Page::Options => {
-                "[1-7] pages  j/k select  h/l change  Space toggle  S-h/l left/right  S-j/k down/up"
-            }
-            Page::Archived => "[1-7] pages  j/k select  u restore  Enter open source",
+            Page::Options => "[1-7] pages  j/k select  h/l change  Enter setup/sync  Ctrl+s sync",
+            Page::Archived => "[1-7] pages  j/k select  u restore  Enter open  Ctrl+s sync",
         }
         .into();
     }
@@ -1271,14 +1310,22 @@ impl App {
                 }
                 None => {}
             },
-            Page::Options => {
-                if self.selected >= 5 {
-                    self.create_vault = self.selected == 6;
+            Page::Options => match self.selected {
+                5 => self.authenticate_github(terminal)?,
+                6 => {
+                    self.query = self.sync_remote.clone().unwrap_or_default();
+                    self.mode = Mode::GitRemoteInput;
+                    self.update_git_remote_status();
+                }
+                7 => self.sync_vault()?,
+                8..=9 => {
+                    self.create_vault = self.selected == 9;
                     self.query.clear();
                     self.mode = Mode::VaultInput;
                     self.update_vault_input_status();
                 }
-            }
+                _ => {}
+            },
             Page::Archived => {
                 if let Some(item) = self.archived.get(self.selected).cloned() {
                     match item {
@@ -1342,6 +1389,38 @@ impl App {
                 self.refresh_index()?;
             }
             Err(error) => self.status = format!("editor failed: {error}"),
+        }
+        Ok(())
+    }
+
+    fn authenticate_github(&mut self, terminal: &mut Tui) -> Result<()> {
+        restore_terminal(terminal)?;
+        let login = Command::new("gh").args(["auth", "login"]).status();
+        let setup = match login {
+            Ok(status) if status.success() => {
+                Command::new("gh").args(["auth", "setup-git"]).status()
+            }
+            Ok(status) => Ok(status),
+            Err(error) => Err(error),
+        };
+        *terminal = setup_terminal()?;
+        self.status = match setup {
+            Ok(status) if status.success() => "GitHub authentication configured securely".into(),
+            Ok(_) => "GitHub authentication was cancelled or failed".into(),
+            Err(error) => format!("could not run GitHub CLI (`gh`): {error}"),
+        };
+        Ok(())
+    }
+
+    fn sync_vault(&mut self) -> Result<()> {
+        self.status = "syncing vault with GitHub...".into();
+        match sync::sync(&self.vault, None) {
+            Ok(summary) => {
+                self.sync_remote = Some(summary.remote);
+                self.refresh_index()?;
+                self.status = format!("vault synced on branch {}", summary.branch);
+            }
+            Err(error) => self.status = format!("sync failed: {error:#}"),
         }
         Ok(())
     }
@@ -2020,6 +2099,23 @@ impl App {
                 }
                 .into(),
             ),
+            ("GitHub authentication", "Enter".into()),
+            (
+                "Repository URL",
+                self.sync_remote
+                    .as_deref()
+                    .map(|remote| truncate(remote, 30))
+                    .unwrap_or_else(|| "Not configured".into()),
+            ),
+            (
+                "Sync now",
+                if self.sync_remote.is_some() {
+                    "Enter"
+                } else {
+                    "Set repository first"
+                }
+                .into(),
+            ),
             ("Open another vault", "Enter".into()),
             ("Create new vault", "Enter".into()),
         ];
@@ -2068,6 +2164,18 @@ impl App {
                 "Shows at most one due card from each section per session, reducing answer leakage between related cards.",
             ),
             (
+                "GitHub authentication",
+                "Securely signs in through GitHub CLI using a browser or device code, then configures Git's credential helper. SSH users can skip this step. Yalive never sees or stores a token.",
+            ),
+            (
+                "Repository URL",
+                "The empty or existing GitHub repository for this vault. Use https://github.com/owner/repo.git after authentication, or git@github.com:owner/repo.git for SSH. URLs containing tokens are rejected.",
+            ),
+            (
+                "Sync now",
+                "Commits local vault changes, fetches and integrates remote changes, then pushes. Conflicts stop safely without overwriting either device. The SQLite index is never uploaded.",
+            ),
+            (
                 "Open another vault",
                 "Closes the current vault and opens an existing vault directory. The selected vault becomes the default next time yalive starts.",
             ),
@@ -2091,6 +2199,7 @@ impl App {
             Line::raw(""),
             section_title("STORAGE"),
             Line::raw(".notes/config.toml"),
+            Line::raw("Git credentials: system credential helper"),
             Line::raw(""),
             Line::from(vec![
                 Span::styled("EDITOR    ", label_style()),

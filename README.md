@@ -15,7 +15,18 @@ Without `--vault`, yalive reopens the last used vault. On first launch it asks w
 cargo run -- --vault ~/Notes index
 cargo run -- --vault ~/Notes diagnostics
 cargo run -- --vault ~/Notes export-reviews
+cargo run -- --vault ~/Notes sync --repo git@github.com:owner/vault.git
+cargo run -- --vault ~/Notes sync
 ```
+
+### GitHub Sync
+
+The Options tab includes the complete setup flow: authenticate with GitHub CLI, enter the repository URL, and select Sync now. Yalive does not accept or store classic access tokens. Use either:
+
+- `git@github.com:owner/vault.git` with an SSH key configured in GitHub.
+- `https://github.com/owner/vault.git` after the Options authentication action, or after running `gh auth login` and `gh auth setup-git`.
+
+Sync commits local changes, fetches and integrates the remote branch, and pushes. Conflicts stop without overwriting either side. Use a standalone vault directory, not a directory nested inside another Git repository. The disposable SQLite index and graph IPC files are automatically ignored; Markdown, images, configuration, and portable review exports are synced.
 
 ### ygraphy
 
@@ -50,9 +61,10 @@ yalive --vault ~/Notes editor diagnostics
 | Review setup | `Space` enrolls a section, `r` reviews due cards, `n` creates a deck |
 | Review setup | `[`/`]` choose active deck, `a` assign card, `x` archive selected item |
 | Refresh | `Shift+r` reloads Markdown and SQLite-backed lists immediately |
+| Sync | `Ctrl+s` syncs the vault from any page or mode |
 | Relations | `j/k` selects in the focused panel, `Enter` follows incoming/outgoing links or opens the center section |
 | Cleanup | `Enter` opens an item, `a` assigns a card, `d` deletes an unreferenced image |
-| Options | `j/k` selects, `h/l` or arrows changes values, `Space` toggles, `Enter` opens/creates a vault |
+| Options | `j/k` selects, `h/l` or arrows changes values, `Space` toggles, `Enter` configures GitHub sync or opens/creates a vault |
 | Search | type to search, arrows navigate, `Enter` open, `Esc` cancel |
 | Review | `Space` reveal cloze, `j/k` and `Space` choose answers |
 | Review | type code gaps, `Tab` changes gap, `Enter` checks |

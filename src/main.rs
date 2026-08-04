@@ -10,6 +10,7 @@ use serde_json::json;
 use yalive::app;
 use yalive::db::Database;
 use yalive::model::{card_capabilities, relation_capabilities};
+use yalive::sync;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -31,6 +32,12 @@ enum Command {
     ExportReviews {
         /// Output path; defaults to .notes/reviews.jsonl.
         output: Option<PathBuf>,
+    },
+    /// Safely pull, merge, commit, and push the vault with Git.
+    Sync {
+        /// GitHub repository URL. Needed only for initial setup or to change the remote.
+        #[arg(long)]
+        repo: Option<String>,
     },
     /// Machine-readable commands for editor integrations.
     Editor {
@@ -92,6 +99,20 @@ fn main() -> Result<()> {
             let output = output.unwrap_or_else(|| vault.join(".notes/reviews.jsonl"));
             let count = db.export_reviews(&output)?;
             println!("exported {count} reviews to {}", output.display());
+            Ok(())
+        }
+        Some(Command::Sync { repo }) => {
+            let summary = sync::sync(&vault, repo.as_deref())?;
+            println!(
+                "synced {} on {}{}",
+                summary.remote,
+                summary.branch,
+                if summary.committed {
+                    " (committed local changes)"
+                } else {
+                    ""
+                }
+            );
             Ok(())
         }
         Some(Command::Editor { command }) => run_editor_command(&vault, command),
