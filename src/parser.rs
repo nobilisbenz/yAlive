@@ -85,7 +85,7 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
 
     let quiz_blocks = collect_quiz_blocks(&source, markdown_offset, relative, &mut diagnostics);
     let relation_re = Regex::new(
-        r"(?m)(?:(supports|contradicts|example-of|prerequisite)::\s*)?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]",
+        r"(?m)(?:(outgoing|contradicts|example-of|ingoing)::\s*)?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]",
     )?;
     let mut sections = Vec::new();
     let mut stack: Vec<(u32, String)> = Vec::new();
@@ -427,6 +427,8 @@ tags: [rust]
 # Rust {#root}
 ## Borrowing {#borrowing}
 Related: [[memory#safety]]
+outgoing:: [[rust#root]]
+ingoing:: [[memory#ownership]]
 
 ```quiz
 id: q1
@@ -465,6 +467,8 @@ gaps:
         assert_eq!(note.sections.len(), 2);
         assert_eq!(note.sections[1].parent_uid.as_deref(), Some("rust#root"));
         assert_eq!(note.sections[1].relations[0].target_uid, "memory#safety");
+        assert_eq!(note.sections[1].relations[1].relation_type, "outgoing");
+        assert_eq!(note.sections[1].relations[2].relation_type, "ingoing");
         assert_eq!(note.sections[1].cards.len(), 4);
         assert!(note.diagnostics.is_empty(), "{:?}", note.diagnostics);
     }

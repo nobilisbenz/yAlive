@@ -28,8 +28,8 @@ With lazy.nvim, point at the plugin's `nvim` directory:
   keys = {
     { "<leader>yc", "<cmd>YaliveCard<cr>", desc = "Yalive card" },
     { "<leader>ys", "<cmd>YaliveSearch<cr>", desc = "Yalive sections" },
-    { "<leader>yo", "<cmd>YaliveLink<cr>", desc = "Yalive outgoing link" },
-    { "<leader>yi", "<cmd>YaliveBacklink<cr>", desc = "Yalive incoming link" },
+    { "<leader>yo", "<cmd>YaliveOutgoingLink<cr>", desc = "Yalive outgoing link" },
+    { "<leader>yi", "<cmd>YaliveIngoingLink<cr>", desc = "Yalive ingoing link" },
     { "<leader>yr", "<cmd>YaliveRelations<cr>", desc = "Yalive relations" },
   },
 }
@@ -51,6 +51,8 @@ require("yalive").setup({
 | `:YaliveSearch [query]` | Search all notes and sections and jump to a result |
 | `:YaliveLink` | Pick a target and relation type, then add an outgoing relation to the current section |
 | `:YaliveBacklink` | Pick a source and relation type, open it, then add a relation back to the current section |
+| `:YaliveOutgoingLink` | Pick a target and immediately add an `outgoing::` relation |
+| `:YaliveIngoingLink` | Pick a target and immediately add an `ingoing::` relation |
 | `:YaliveRelations` | Browse both outgoing relations and incoming backlinks |
 | `:YaliveIndex` | Reindex the vault |
 | `:YaliveDiagnostics` | Publish parser and broken-link diagnostics for the current buffer |

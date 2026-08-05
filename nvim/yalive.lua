@@ -10,8 +10,8 @@ return {
   keys = {
     { "<leader>yc", "<cmd>YaliveCard<cr>", desc = "Yalive card" },
     { "<leader>ys", "<cmd>YaliveSearch<cr>", desc = "Yalive search" },
-    { "<leader>yo", "<cmd>YaliveLink<cr>", desc = "Yalive outgoing link" },
-    { "<leader>yi", "<cmd>YaliveBacklink<cr>", desc = "Yalive incoming link" },
+    { "<leader>yo", "<cmd>YaliveOutgoingLink<cr>", desc = "Yalive outgoing link" },
+    { "<leader>yi", "<cmd>YaliveIngoingLink<cr>", desc = "Yalive ingoing link" },
     { "<leader>yr", "<cmd>YaliveRelations<cr>", desc = "Yalive relations" },
     { "<leader>yx", "<cmd>YaliveIndex<cr>", desc = "Yalive index" },
     { "<leader>yd", "<cmd>YaliveDiagnostics<cr>", desc = "Yalive diagnostics" },

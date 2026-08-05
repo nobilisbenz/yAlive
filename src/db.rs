@@ -946,7 +946,8 @@ impl Database {
              LEFT JOIN sections target ON target.section_uid=r.target_section_uid
              JOIN files source_file ON source_file.id=source.file_id
              LEFT JOIN files target_file ON target_file.id=target.file_id
-             WHERE source.section_uid=?1 AND source.archived_at IS NULL
+             WHERE source.section_uid=?1 AND r.relation_type != 'ingoing'
+               AND source.archived_at IS NULL
                AND source_file.archived_at IS NULL
                AND (target.id IS NULL OR (target.archived_at IS NULL
                                           AND target_file.archived_at IS NULL))
@@ -956,9 +957,29 @@ impl Database {
              JOIN files source_file ON source_file.id=source.file_id
              JOIN sections target ON target.section_uid=r.target_section_uid
              JOIN files target_file ON target_file.id=target.file_id
-             WHERE r.target_section_uid=?1 AND source.archived_at IS NULL
-               AND source_file.archived_at IS NULL AND target.archived_at IS NULL
-               AND target_file.archived_at IS NULL",
+             WHERE r.target_section_uid=?1 AND r.relation_type != 'ingoing'
+               AND source.archived_at IS NULL
+                AND source_file.archived_at IS NULL AND target.archived_at IS NULL
+                AND target_file.archived_at IS NULL
+             UNION ALL
+             SELECT r.relation_type, source.section_uid, source.heading, 0
+             FROM relations r JOIN sections source ON source.id=r.source_section_id
+             JOIN files source_file ON source_file.id=source.file_id
+             JOIN sections target ON target.section_uid=r.target_section_uid
+             JOIN files target_file ON target_file.id=target.file_id
+             WHERE r.target_section_uid=?1 AND r.relation_type = 'ingoing'
+               AND source.archived_at IS NULL AND source_file.archived_at IS NULL
+               AND target.archived_at IS NULL AND target_file.archived_at IS NULL
+             UNION ALL
+             SELECT r.relation_type, r.target_section_uid, target.heading, 1
+             FROM relations r JOIN sections source ON source.id=r.source_section_id
+             LEFT JOIN sections target ON target.section_uid=r.target_section_uid
+             JOIN files source_file ON source_file.id=source.file_id
+             LEFT JOIN files target_file ON target_file.id=target.file_id
+             WHERE source.section_uid=?1 AND r.relation_type = 'ingoing'
+               AND source.archived_at IS NULL AND source_file.archived_at IS NULL
+               AND (target.id IS NULL OR (target.archived_at IS NULL
+                                          AND target_file.archived_at IS NULL))",
         )?;
         Ok(statement
             .query_map([section_uid], |row| {
@@ -1012,7 +1033,11 @@ impl Database {
         };
         let links = {
             let mut statement = self.connection.prepare(
-                "SELECT source.section_uid, target.section_uid, r.relation_type
+                "SELECT CASE WHEN r.relation_type = 'ingoing'
+                             THEN target.section_uid ELSE source.section_uid END,
+                        CASE WHEN r.relation_type = 'ingoing'
+                             THEN source.section_uid ELSE target.section_uid END,
+                        r.relation_type
                  FROM relations r
                  JOIN sections source ON source.id=r.source_section_id
                  JOIN files source_file ON source_file.id=source.file_id
@@ -1657,7 +1682,7 @@ prompt: One {{c1::writer}}.
         let dir = tempdir().unwrap();
         fs::write(
             dir.path().join("alpha.md"),
-            "---\nid: alpha\ntitle: Alpha\ntopic: Systems\n---\n# Alpha {#root}\n\nsupports:: [[beta#root]]\n",
+            "---\nid: alpha\ntitle: Alpha\ntopic: Systems\n---\n# Alpha {#root}\n\noutgoing:: [[beta#root]]\n",
         )
         .unwrap();
         fs::write(
@@ -1680,7 +1705,43 @@ prompt: One {{c1::writer}}.
         assert!(graph.links.iter().any(|link| {
             link.source == "alpha#root"
                 && link.target == "beta#root"
-                && link.relation_type == "supports"
+                && link.relation_type == "outgoing"
+        }));
+    }
+
+    #[test]
+    fn ingoing_relations_point_back_to_the_declaring_section() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("alpha.md"),
+            "---\nid: alpha\ntitle: Alpha\n---\n# Alpha {#root}\n\ningoing:: [[beta#root]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("beta.md"),
+            "---\nid: beta\ntitle: Beta\n---\n# Beta {#root}\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        let graph = db.graph().unwrap();
+        assert!(graph.links.iter().any(|link| {
+            link.source == "beta#root"
+                && link.target == "alpha#root"
+                && link.relation_type == "ingoing"
+        }));
+        let alpha = db.relations("alpha#root").unwrap();
+        assert!(alpha.iter().any(|relation| {
+            relation.incoming
+                && relation.target_uid == "beta#root"
+                && relation.relation_type == "ingoing"
+        }));
+        let beta = db.relations("beta#root").unwrap();
+        assert!(beta.iter().any(|relation| {
+            !relation.incoming
+                && relation.target_uid == "alpha#root"
+                && relation.relation_type == "ingoing"
         }));
     }
 

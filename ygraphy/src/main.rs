@@ -139,6 +139,15 @@ impl ApplicationHandler for GraphApp {
                     renderer.fit(&self.layout);
                     renderer.window.request_redraw();
                 }
+                KeyCode::KeyR => match reload_graph(&self.vault) {
+                    Ok(graph) => {
+                        self.layout = LayoutGraph::new(graph);
+                        renderer.reset_interaction();
+                        renderer.fit(&self.layout);
+                        renderer.window.request_redraw();
+                    }
+                    Err(error) => eprintln!("could not refresh graph: {error:#}"),
+                },
                 _ => {}
             },
             WindowEvent::CursorMoved { position, .. } => {
@@ -178,6 +187,12 @@ impl ApplicationHandler for GraphApp {
             _ => {}
         }
     }
+}
+
+fn reload_graph(vault: &Path) -> Result<GraphData> {
+    let mut database = Database::open(vault)?;
+    database.index_vault(vault)?;
+    database.graph()
 }
 
 fn focus_in_tui(vault: &Path, uid: &str) -> Result<()> {
@@ -533,10 +548,10 @@ fn hash_unit(value: &str) -> f32 {
 
 fn relation_color(kind: &str) -> [f32; 4] {
     match kind {
-        "supports" => [0.30, 0.82, 0.55, 0.72],
+        "outgoing" => [0.30, 0.82, 0.55, 0.72],
         "contradicts" => [0.95, 0.34, 0.34, 0.76],
         "example-of" => [0.96, 0.68, 0.25, 0.72],
-        "prerequisite" => [0.68, 0.48, 0.96, 0.76],
+        "ingoing" => [0.68, 0.48, 0.96, 0.76],
         _ => [0.40, 0.68, 0.92, 0.62],
     }
 }
@@ -934,6 +949,12 @@ impl Renderer {
         self.camera.center[1] += before[1] - after[1];
     }
 
+    fn reset_interaction(&mut self) {
+        self.drag = None;
+        self.last_click = None;
+        self.selected = None;
+    }
+
     fn render(&mut self, layout: &LayoutGraph) -> std::result::Result<(), wgpu::SurfaceError> {
         self.queue
             .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&self.camera));
@@ -970,20 +991,19 @@ impl Renderer {
                 color,
             });
         }
-        let lines = layout
+        let mut lines = layout
             .links
             .iter()
-            .map(|&(a, b, color)| LineInstance {
-                endpoints: [
-                    layout.nodes[a].position[0],
-                    layout.nodes[a].position[1],
-                    layout.nodes[b].position[0],
-                    layout.nodes[b].position[1],
-                ],
-                color,
-                width: 1.25,
+            .flat_map(|&(a, b, color)| {
+                directed_line_instances(
+                    layout.nodes[a].position,
+                    layout.nodes[b].position,
+                    color,
+                    self.camera.zoom,
+                )
             })
-            .chain(layout.parent_links.iter().map(|&(a, b)| LineInstance {
+            .collect::<Vec<_>>();
+        lines.extend(layout.parent_links.iter().map(|&(a, b)| LineInstance {
                 endpoints: [
                     layout.nodes[a].position[0],
                     layout.nodes[a].position[1],
@@ -992,8 +1012,7 @@ impl Renderer {
                 ],
                 color: [0.55, 0.60, 0.66, 0.34],
                 width: 0.8,
-            }))
-            .collect::<Vec<_>>();
+            }));
         let circle_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1173,6 +1192,28 @@ fn palette(index: usize) -> [f32; 4] {
     COLORS[index % COLORS.len()]
 }
 
+fn directed_line_instances(
+    source: [f32; 2],
+    target: [f32; 2],
+    color: [f32; 4],
+    zoom: f32,
+) -> [LineInstance; 3] {
+    let direction = normalize_or_hash(sub(target, source), 0, 1);
+    let normal = [-direction[1], direction[0]];
+    let tip = sub(target, [direction[0] * SECTION_RADIUS, direction[1] * SECTION_RADIUS]);
+    let arrow_length = 10.0 / zoom.max(0.04);
+    let arrow_width = 5.5 / zoom.max(0.04);
+    let base = sub(tip, [direction[0] * arrow_length, direction[1] * arrow_length]);
+    let left = [base[0] + normal[0] * arrow_width, base[1] + normal[1] * arrow_width];
+    let right = [base[0] - normal[0] * arrow_width, base[1] - normal[1] * arrow_width];
+    let line = |a: [f32; 2], b: [f32; 2]| LineInstance {
+        endpoints: [a[0], a[1], b[0], b[1]],
+        color,
+        width: 1.25,
+    };
+    [line(source, tip), line(left, tip), line(right, tip)]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1208,7 +1249,7 @@ mod tests {
             links: vec![GraphLink {
                 source: "n#a".into(),
                 target: "n#b".into(),
-                relation_type: "supports".into(),
+                relation_type: "outgoing".into(),
             }],
         };
         let layout = LayoutGraph::new(graph);

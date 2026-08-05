@@ -303,8 +303,8 @@ pub fn relation_capabilities() -> Vec<RelationCapability> {
             prefix: "",
         },
         RelationCapability {
-            relation_type: "supports",
-            prefix: "supports:: ",
+            relation_type: "outgoing",
+            prefix: "outgoing:: ",
         },
         RelationCapability {
             relation_type: "contradicts",
@@ -315,8 +315,8 @@ pub fn relation_capabilities() -> Vec<RelationCapability> {
             prefix: "example-of:: ",
         },
         RelationCapability {
-            relation_type: "prerequisite",
-            prefix: "prerequisite:: ",
+            relation_type: "ingoing",
+            prefix: "ingoing:: ",
         },
     ]
 }

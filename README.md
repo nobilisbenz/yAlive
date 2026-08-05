@@ -126,7 +126,7 @@ pinned: true
 # Rust Ownership {#root}
 ## Borrowing {#borrowing}
 
-prerequisite:: [[rust-basics#references]]
+ingoing:: [[rust-basics#references]]
 ```
 
 Quiz blocks are fenced `quiz` blocks containing YAML. Supported `type` values are `cloze`, `multiple-choice`, and `code-gap`. See [`examples/vault/rust-ownership.md`](examples/vault/rust-ownership.md) for complete examples.

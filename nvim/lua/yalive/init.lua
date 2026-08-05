@@ -199,6 +199,20 @@ local function choose_relation(capabilities, callback)
   end, callback)
 end
 
+local function use_relation(capabilities, relation_type, callback)
+  if not relation_type then
+    choose_relation(capabilities, callback)
+    return
+  end
+  for _, kind in ipairs(capabilities.relation_types) do
+    if kind.relation_type == relation_type then
+      callback(kind)
+      return
+    end
+  end
+  notify("Unsupported relation type: " .. relation_type, vim.log.levels.ERROR)
+end
+
 local function relation_text(kind, target_uid)
   return kind.prefix .. "[[" .. target_uid .. "]]"
 end
@@ -230,7 +244,7 @@ function M.search(query)
   end)
 end
 
-function M.link(direction)
+function M.link(direction, relation_type)
   local vault = current_vault()
   if not vault then return end
   local all_sections = sections(vault, "")
@@ -241,7 +255,7 @@ function M.link(direction)
   if not capabilities then return end
 
   pick(all_sections, direction == "incoming" and "Source section" or "Target section", section_label, function(selected)
-    choose_relation(capabilities, function(kind)
+    use_relation(capabilities, relation_type, function(kind)
       if direction == "incoming" then
         open_section(vault, selected)
         insert_line(relation_text(kind, origin.uid))
@@ -313,6 +327,8 @@ local function create_commands()
   vim.api.nvim_create_user_command("YaliveSearch", function(opts) M.search(opts.args) end, { nargs = "*" })
   vim.api.nvim_create_user_command("YaliveLink", function() M.link("outgoing") end, {})
   vim.api.nvim_create_user_command("YaliveBacklink", function() M.link("incoming") end, {})
+  vim.api.nvim_create_user_command("YaliveOutgoingLink", function() M.link("outgoing", "outgoing") end, {})
+  vim.api.nvim_create_user_command("YaliveIngoingLink", function() M.link("outgoing", "ingoing") end, {})
   vim.api.nvim_create_user_command("YaliveRelations", M.relations, {})
   vim.api.nvim_create_user_command("YaliveIndex", function() M.index(false) end, {})
   vim.api.nvim_create_user_command("YaliveDiagnostics", function() M.diagnostics(0) end, {})

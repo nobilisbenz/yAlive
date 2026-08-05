@@ -11,7 +11,7 @@ tags: [rust, memory]
 
 Every value has exactly one owner. When the owner leaves scope, the value is dropped.
 
-supports:: [[rust-ownership#borrowing]]
+outgoing:: [[rust-ownership#borrowing]]
 
 ```quiz
 id: ownership-model
@@ -25,7 +25,7 @@ prompt: |
 
 Borrowing lets code access a value without owning it.
 
-prerequisite:: [[rust-ownership#ownership-rules]]
+ingoing:: [[rust-ownership#ownership-rules]]
 
 ```quiz
 id: owner-scope

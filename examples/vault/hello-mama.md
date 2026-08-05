@@ -38,4 +38,4 @@ gaps:
 
 ## cooler then me {#cooler-then-me}
 
-supports:: [[rust-ownership#borrowing]]
+outgoing:: [[rust-ownership#borrowing]]
