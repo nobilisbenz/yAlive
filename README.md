@@ -2,6 +2,16 @@
 
 `yalive` is a section-first Markdown knowledge vault and spaced-repetition TUI. Markdown owns the knowledge; a disposable SQLite database provides FTS5 search, graph edges, diagnostics, and FSRS review state.
 
+## Apps
+
+| | App | Download | Purpose |
+| --- | --- | --- | --- |
+| <img src="assets/icons/yalive.svg" width="64" alt="Black circle with a blue center" /> | **yalive** | [Linux x86_64](https://github.com/nobilisbenz/yAlive/releases/latest/download/yalive-linux-x86_64.tar.gz) | Write, search, connect, and review from the terminal. |
+| <img src="assets/icons/ygraphy.svg" width="64" alt="Black circle with a red center" /> | **yGraphy** | [Linux x86_64](https://github.com/nobilisbenz/yGraphy/releases/latest/download/ygraphy-linux-x86_64.tar.gz) | Explore the vault as an interactive native graph. |
+| <img src="assets/icons/yreviewy.svg" width="64" alt="Black circle with a lime center" /> | **yReviewy** | [Android ARM64](https://github.com/nobilisbenz/yReviewy/releases/latest/download/yreviewy-android-arm64.apk) | Review cards offline from an Android phone. |
+
+Downloads are published in each app's GitHub repository. Every release also includes `SHA256SUMS`.
+
 ## Run
 
 ```bash
@@ -58,6 +68,10 @@ npm run tauri android dev
 ```
 
 Use `npm run tauri android build` for an APK/AAB. On first launch, enter `owner/repository`, the branch, and the classic token. The token is kept in Android app-private Rust storage and is never exposed to the web view, snapshot, or review mailbox. Revoke the token from GitHub if the phone is lost.
+
+### Publishing Releases
+
+Pushing a semantic version tag such as `v0.1.0` in an app's repository builds that app and publishes its GitHub release. The yReviewy repository requires these Actions secrets for Android signing: `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, and `ANDROID_KEY_PASSWORD`. Store the keystore as a single-line Base64 value.
 
 The normal rhythm is: review offline on either device, sync the phone to upload its mailbox, then run desktop sync to import those events and publish current cards and statistics. A second phone sync receives the refreshed state. The phone groups cards by deck, keeps cards without a deck in a separate No deck group, and offers Force all when you want to repeat a deck before its cards are due.
 
