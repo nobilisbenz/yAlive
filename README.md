@@ -30,7 +30,7 @@ Sync commits local changes, fetches and integrates the remote branch, and pushes
 
 ### Android Reviewer
 
-[`yreviewy/`](yreviewy/) is a Tauri v2 Android companion for reviewing from a phone. It reads a compact, versioned card snapshot through the GitHub Contents API, works from that snapshot offline, and appends reviews to a device-specific mailbox in the vault:
+[`yReviewy/`](yReviewy/) is a Tauri v2 Android companion for reviewing from a phone. It reads a compact, versioned card snapshot through the GitHub Contents API, works from that snapshot offline, and appends reviews to a device-specific mailbox in the vault:
 
 ```text
 .notes/mobile-snapshot.json
@@ -50,7 +50,7 @@ cargo run -- --vault ~/Notes sync
 3. Install Android Studio, its SDK/NDK, and the Android Rust targets required by [Tauri mobile prerequisites](https://v2.tauri.app/start/prerequisites/). Then initialize and run the app:
 
 ```bash
-cd yreviewy
+cd yReviewy
 npm install
 cargo check --manifest-path src-tauri/Cargo.toml
 npm run tauri android init
@@ -61,12 +61,12 @@ Use `npm run tauri android build` for an APK/AAB. On first launch, enter `owner/
 
 The normal rhythm is: review offline on either device, sync the phone to upload its mailbox, then run desktop sync to import those events and publish current cards and statistics. A second phone sync receives the refreshed state. The phone groups cards by deck, keeps cards without a deck in a separate No deck group, and offers Force all when you want to repeat a deck before its cards are due.
 
-### ygraphy
+### yGraphy
 
-`ygraphy/` is a native Rust/wgpu graph for the same vault. Sections are connected by their typed relations. Soft force constraints cluster sections inside notes and notes inside topics, while fitted circles make the `topic -> note -> section` hierarchy visible.
+`yGraphy/` is a native Rust/wgpu graph for the same vault. Sections are connected by their typed relations. Soft force constraints cluster sections inside notes and notes inside topics, while fitted circles make the `topic -> note -> section` hierarchy visible.
 
 ```bash
-cd ygraphy
+cd yGraphy
 cargo run --release -- --vault ../examples/vault
 ```
 

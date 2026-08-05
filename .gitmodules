@@ -1,0 +1,6 @@
+[submodule "yGraphy"]
+	path = yGraphy
+	url = git@github.com:nobilisbenz/yGraphy.git
+[submodule "yReviewy"]
+	path = yReviewy
+	url = git@github.com:nobilisbenz/yReviewy.git
