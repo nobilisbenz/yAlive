@@ -1554,18 +1554,18 @@ impl App {
             .split(area);
         let dashboard_items = self.dashboard_items();
         let mut last_topic = None;
-        let items = dashboard_items
-            .iter()
-            .map(|item| match item {
+        let mut items = Vec::new();
+        let mut selected_row = None;
+        for (item_index, item) in dashboard_items.iter().enumerate() {
+            let item = match item {
                 DashboardItem::Note(index) => {
                     let note = &self.notes[*index];
                     let topic = note.topic.as_deref().unwrap_or("No topic");
-                    let mut lines = Vec::new();
                     if last_topic != Some(topic) {
-                        lines.push(section_title(&topic.to_uppercase()));
+                        items.push(ListItem::new(section_title(&topic.to_uppercase())));
                         last_topic = Some(topic);
                     }
-                    lines.push(Line::from(vec![
+                    ListItem::new(Line::from(vec![
                         Span::styled(
                             if note.pinned { "* " } else { "  " },
                             Style::default().fg(Color::Yellow),
@@ -1576,16 +1576,19 @@ impl App {
                                 .fg(Color::White)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                    ]));
-                    ListItem::new(lines)
+                    ]))
                 }
                 DashboardItem::Section(index) => ListItem::new(Line::from(vec![
                     Span::styled("    |- ", Style::default().fg(Color::DarkGray)),
                     Span::raw(self.sections[*index].heading.clone()),
                 ])),
-            })
-            .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(self.selected));
+            };
+            if item_index == self.selected {
+                selected_row = Some(items.len());
+            }
+            items.push(item);
+        }
+        let mut state = ListState::default().with_selected(selected_row);
         frame.render_stateful_widget(
             List::new(items)
                 .block(focused_block(" Library ", self.focused_panel == 0))
@@ -1721,55 +1724,57 @@ impl App {
             .split(area);
         let review_items = self.review_items();
         let mut seen = [false; 3];
-        let items = review_items
-            .iter()
-            .map(|item| {
-                let (group, line) = match item {
-                    ReviewItem::Section(index) => {
-                        let section = &self.review_sections[*index];
-                        (
-                            0,
-                            Line::from(format!(
-                                "  [{}] {} / {}",
-                                if section.enrolled { "x" } else { " " },
-                                section.note_title,
-                                section.heading
-                            )),
-                        )
-                    }
-                    ReviewItem::Deck(index) => {
-                        let deck = &self.decks[*index];
-                        (
-                            1,
-                            Line::styled(
-                                format!(
-                                    "  {} {}  {} cards",
-                                    if *index == self.active_deck { "*" } else { " " },
-                                    deck.name,
-                                    deck.card_count
-                                ),
-                                if *index == self.active_deck {
-                                    Style::default().fg(Color::Yellow)
-                                } else {
-                                    Style::default()
-                                },
-                            ),
-                        )
-                    }
-                    ReviewItem::Card(index) => {
-                        (2, Line::from(format!("  {}", self.cards[*index].label)))
-                    }
-                };
-                let mut lines = Vec::new();
-                if !seen[group] {
-                    lines.push(section_title(["SECTIONS", "DECKS", "CARDS"][group]));
-                    seen[group] = true;
+        let mut items = Vec::new();
+        let mut selected_row = None;
+        for (item_index, item) in review_items.iter().enumerate() {
+            let (group, line) = match item {
+                ReviewItem::Section(index) => {
+                    let section = &self.review_sections[*index];
+                    (
+                        0,
+                        Line::from(format!(
+                            "  [{}] {} / {}",
+                            if section.enrolled { "x" } else { " " },
+                            section.note_title,
+                            section.heading
+                        )),
+                    )
                 }
-                lines.push(line);
-                ListItem::new(lines)
-            })
-            .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(self.selected));
+                ReviewItem::Deck(index) => {
+                    let deck = &self.decks[*index];
+                    (
+                        1,
+                        Line::styled(
+                            format!(
+                                "  {} {}  {} cards",
+                                if *index == self.active_deck { "*" } else { " " },
+                                deck.name,
+                                deck.card_count
+                            ),
+                            if *index == self.active_deck {
+                                Style::default().fg(Color::Yellow)
+                            } else {
+                                Style::default()
+                            },
+                        ),
+                    )
+                }
+                ReviewItem::Card(index) => {
+                    (2, Line::from(format!("  {}", self.cards[*index].label)))
+                }
+            };
+            if !seen[group] {
+                items.push(ListItem::new(section_title(
+                    ["SECTIONS", "DECKS", "CARDS"][group],
+                )));
+                seen[group] = true;
+            }
+            if item_index == self.selected {
+                selected_row = Some(items.len());
+            }
+            items.push(ListItem::new(line));
+        }
+        let mut state = ListState::default().with_selected(selected_row);
         frame.render_stateful_widget(
             List::new(items)
                 .block(focused_block(" Review organizer ", self.focused_panel == 0))
@@ -1907,37 +1912,37 @@ impl App {
             .split(area);
         let clean_items = self.clean_items();
         let mut seen = [false; 3];
-        let items = clean_items
-            .iter()
-            .map(|item| {
-                let (group, line) = match item {
-                    CleanItem::Note(index) => {
-                        (0, Line::raw(format!("  ! {}", self.notes[*index].title)))
-                    }
-                    CleanItem::Card(index) => {
-                        (1, Line::raw(format!("  ! {}", self.cards[*index].label)))
-                    }
-                    CleanItem::Image(index) => (
-                        2,
-                        Line::raw(format!("  ! {}", self.orphan_images[*index].display())),
-                    ),
-                };
-                let mut lines = Vec::new();
-                if !seen[group] {
-                    lines.push(section_title(
-                        [
-                            "NOTES WITHOUT TOPICS",
-                            "CARDS WITHOUT DECKS",
-                            "UNUSED IMAGES",
-                        ][group],
-                    ));
-                    seen[group] = true;
+        let mut items = Vec::new();
+        let mut selected_row = None;
+        for (item_index, item) in clean_items.iter().enumerate() {
+            let (group, line) = match item {
+                CleanItem::Note(index) => {
+                    (0, Line::raw(format!("  ! {}", self.notes[*index].title)))
                 }
-                lines.push(line);
-                ListItem::new(lines)
-            })
-            .collect::<Vec<_>>();
-        let mut state = ListState::default().with_selected(Some(self.selected));
+                CleanItem::Card(index) => {
+                    (1, Line::raw(format!("  ! {}", self.cards[*index].label)))
+                }
+                CleanItem::Image(index) => (
+                    2,
+                    Line::raw(format!("  ! {}", self.orphan_images[*index].display())),
+                ),
+            };
+            if !seen[group] {
+                items.push(ListItem::new(section_title(
+                    [
+                        "NOTES WITHOUT TOPICS",
+                        "CARDS WITHOUT DECKS",
+                        "UNUSED IMAGES",
+                    ][group],
+                )));
+                seen[group] = true;
+            }
+            if item_index == self.selected {
+                selected_row = Some(items.len());
+            }
+            items.push(ListItem::new(line));
+        }
+        let mut state = ListState::default().with_selected(selected_row);
         frame.render_stateful_widget(
             List::new(items)
                 .block(focused_block(" Cleanup queue ", self.focused_panel == 0))
