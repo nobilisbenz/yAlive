@@ -10,8 +10,8 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use crate::config::ReviewOrder;
 use crate::model::{
     ArchivedItem, CardContent, CardRow, DeckRow, Diagnostic, GraphData, GraphLink, GraphNote,
-    GraphSection, NoteRow, ParsedNote, RelationRow, ReviewCard, ReviewSectionRow, SectionRow,
-    Statistics,
+    GraphSection, MobileCard, MobileDeck, MobileSnapshot, NoteRow, ParsedNote, RelationRow,
+    ReviewCard, ReviewEvent, ReviewScope, ReviewSectionRow, SectionRow, Statistics,
 };
 use crate::parser::{markdown_files, parse_note};
 
@@ -96,6 +96,11 @@ impl Database {
                 stability_after REAL,
                 difficulty_before REAL,
                 difficulty_after REAL
+             );
+             CREATE TABLE IF NOT EXISTS synced_review_events (
+                event_id TEXT PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                imported_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS decks (
                 id INTEGER PRIMARY KEY,
@@ -1041,6 +1046,26 @@ impl Database {
         review_order: ReviewOrder,
         bury_siblings: bool,
     ) -> Result<Vec<ReviewCard>> {
+        self.review_cards(
+            ReviewScope::All,
+            false,
+            new_cards_per_day,
+            max_reviews_per_day,
+            review_order,
+            bury_siblings,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn review_cards(
+        &self,
+        scope: ReviewScope,
+        force: bool,
+        new_cards_per_day: usize,
+        max_reviews_per_day: usize,
+        review_order: ReviewOrder,
+        bury_siblings: bool,
+    ) -> Result<Vec<ReviewCard>> {
         let now = Utc::now().timestamp();
         let today = Local::now().date_naive();
         let day_start = Local
@@ -1060,20 +1085,31 @@ impl Database {
         )?;
         let remaining = max_reviews_per_day.saturating_sub(reviewed_today);
         let remaining_new = new_cards_per_day.saturating_sub(introduced_today);
+        let (scope_kind, deck_id) = match scope {
+            ReviewScope::All => (0, -1),
+            ReviewScope::Deckless => (1, -1),
+            ReviewScope::Deck(deck_id) => (2, deck_id),
+        };
         let mut statement = self.connection.prepare(
             "SELECT c.id, c.card_uid, c.section_uid, c.definition, rs.due_at,
                     rs.stability, rs.difficulty, rs.last_review_at, rs.review_count
              FROM cards c JOIN review_state rs ON rs.card_id=c.id
              JOIN sections s ON s.section_uid=c.section_uid JOIN files f ON f.id=s.file_id
              WHERE c.suspended=0 AND c.archived_at IS NULL AND s.archived_at IS NULL
-               AND f.archived_at IS NULL AND rs.due_at <= ?1
-               AND (NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
-                    OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
-                              WHERE cd.card_id=c.id AND d.archived_at IS NULL))
-             ORDER BY rs.due_at, c.id",
+               AND f.archived_at IS NULL AND (?4 OR rs.due_at <= ?1)
+               AND ((?2=0 AND (
+                        NOT EXISTS(SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id)
+                        OR EXISTS(SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                                  WHERE cd.card_id=c.id AND d.archived_at IS NULL)))
+                    OR (?2=1 AND NOT EXISTS(
+                        SELECT 1 FROM card_decks cd WHERE cd.card_id=c.id))
+                    OR (?2=2 AND EXISTS(
+                        SELECT 1 FROM card_decks cd JOIN decks d ON d.id=cd.deck_id
+                        WHERE cd.card_id=c.id AND cd.deck_id=?3 AND d.archived_at IS NULL)))
+              ORDER BY rs.due_at, c.id",
         )?;
         let mut cards = statement
-            .query_map([now], |row| {
+            .query_map(params![now, scope_kind, deck_id, force], |row| {
                 let definition: String = row.get(3)?;
                 let content: CardContent = serde_json::from_str(&definition).map_err(|error| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -1098,6 +1134,9 @@ impl Database {
         if review_order == ReviewOrder::Random {
             use rand::seq::SliceRandom;
             cards.shuffle(&mut rand::rng());
+        }
+        if force {
+            return Ok(cards);
         }
         let mut new_cards = 0;
         let mut sections = HashSet::new();
@@ -1126,7 +1165,32 @@ impl Database {
         if !(1..=4).contains(&rating) {
             return Err(anyhow!("rating must be between 1 and 4"));
         }
-        let now = Utc::now().timestamp();
+        self.record_review_at(
+            card,
+            rating,
+            correct,
+            response_ms,
+            submitted,
+            desired_retention,
+            Utc::now().timestamp(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_review_at(
+        &mut self,
+        card: &ReviewCard,
+        rating: u32,
+        correct: Option<bool>,
+        response_ms: i64,
+        submitted: Option<&str>,
+        desired_retention: f32,
+        reviewed_at: i64,
+    ) -> Result<Option<u32>> {
+        if !(1..=4).contains(&rating) {
+            return Err(anyhow!("rating must be between 1 and 4"));
+        }
+        let now = reviewed_at;
         let elapsed_days = card
             .last_review_at
             .map(|last| ((now - last) / 86_400).max(0) as u32)
@@ -1190,6 +1254,166 @@ impl Database {
         )?;
         transaction.commit()?;
         Ok(Some(scheduled_days))
+    }
+
+    pub fn import_review_events(
+        &mut self,
+        events: &[ReviewEvent],
+        desired_retention: f32,
+    ) -> Result<usize> {
+        let mut events = events.to_vec();
+        events.sort_by(|left, right| {
+            (left.reviewed_at, &left.event_id).cmp(&(right.reviewed_at, &right.event_id))
+        });
+        let mut imported = 0;
+        for event in events {
+            if !(1..=4).contains(&event.rating)
+                || event.event_id.trim().is_empty()
+                || event.device_id.trim().is_empty()
+            {
+                continue;
+            }
+            let seen = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM synced_review_events WHERE event_id=?1)",
+                [&event.event_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if seen {
+                continue;
+            }
+            let card = self
+                .connection
+                .query_row(
+                    "SELECT c.id, c.card_uid, c.section_uid, c.definition, rs.due_at,
+                    rs.stability, rs.difficulty, rs.last_review_at, rs.review_count
+                 FROM cards c JOIN review_state rs ON rs.card_id=c.id WHERE c.card_uid=?1",
+                    [&event.card_uid],
+                    review_card_from_row,
+                )
+                .optional()?;
+            let Some(card) = card else {
+                continue;
+            };
+            if card
+                .last_review_at
+                .is_some_and(|last| last >= event.reviewed_at)
+            {
+                self.connection.execute(
+                    "INSERT INTO review_log(card_id, card_uid, reviewed_at, rating,
+                        answer_correct, response_ms, elapsed_days, scheduled_days,
+                        stability_before, stability_after, difficulty_before, difficulty_after)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, ?7, ?7, ?8, ?8)",
+                    params![
+                        card.id,
+                        card.uid,
+                        event.reviewed_at,
+                        event.rating,
+                        event.answer_correct.map(i64::from),
+                        event.response_ms.max(0),
+                        card.stability,
+                        card.difficulty,
+                    ],
+                )?;
+                self.connection.execute(
+                    "INSERT INTO synced_review_events(event_id, device_id, imported_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![event.event_id, event.device_id, Utc::now().timestamp()],
+                )?;
+                imported += 1;
+                continue;
+            }
+            if self
+                .record_review_at(
+                    &card,
+                    event.rating,
+                    event.answer_correct,
+                    event.response_ms.max(0),
+                    None,
+                    desired_retention,
+                    event.reviewed_at,
+                )?
+                .is_some()
+            {
+                self.connection.execute(
+                    "INSERT INTO synced_review_events(event_id, device_id, imported_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![event.event_id, event.device_id, Utc::now().timestamp()],
+                )?;
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+
+    pub fn mobile_snapshot(
+        &self,
+        new_cards_per_day: usize,
+        max_reviews_per_day: usize,
+        review_order: ReviewOrder,
+        bury_siblings: bool,
+    ) -> Result<MobileSnapshot> {
+        let generated_at = Utc::now().timestamp();
+        let decks = self.decks()?;
+        let rows = self.card_rows()?;
+        let deck_ids = rows
+            .into_iter()
+            .map(|row| (row.id, row.decks))
+            .collect::<std::collections::HashMap<_, _>>();
+        let due_without_deck = self
+            .review_cards(
+                ReviewScope::Deckless,
+                false,
+                new_cards_per_day,
+                max_reviews_per_day,
+                review_order,
+                bury_siblings,
+            )?
+            .into_iter()
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
+        let mut due_deck_ids = std::collections::HashMap::<i64, Vec<i64>>::new();
+        for deck in &decks {
+            for card in self.review_cards(
+                ReviewScope::Deck(deck.id),
+                false,
+                new_cards_per_day,
+                max_reviews_per_day,
+                review_order,
+                bury_siblings,
+            )? {
+                due_deck_ids.entry(card.id).or_default().push(deck.id);
+            }
+        }
+        let cards = self
+            .review_cards(
+                ReviewScope::All,
+                true,
+                new_cards_per_day,
+                max_reviews_per_day,
+                ReviewOrder::Due,
+                false,
+            )?
+            .into_iter()
+            .map(|card| MobileCard {
+                due_without_deck: due_without_deck.contains(&card.id),
+                due_deck_ids: due_deck_ids.remove(&card.id).unwrap_or_default(),
+                deck_ids: deck_ids.get(&card.id).cloned().unwrap_or_default(),
+                card,
+            })
+            .collect();
+        Ok(MobileSnapshot {
+            protocol_version: 2,
+            generated_at,
+            decks: decks
+                .into_iter()
+                .map(|deck| MobileDeck {
+                    id: deck.id,
+                    name: deck.name,
+                })
+                .collect(),
+            cards,
+            statistics: self.statistics()?,
+        })
     }
 
     pub fn diagnostics(&self) -> Result<Vec<Diagnostic>> {
@@ -1485,6 +1709,126 @@ prompt: One {{c1::writer}}.
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn imports_mobile_reviews_once() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("test.md"),
+            "# Test {#root}\n\n```quiz\nid: q1\ntype: cloze\nprompt: '{{c1::answer}}'\n```\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        let card = db
+            .due_cards(20, 200, ReviewOrder::Due, false)
+            .unwrap()
+            .remove(0);
+        let event = ReviewEvent {
+            event_id: "phone-1-event-1".into(),
+            device_id: "phone-1".into(),
+            card_uid: card.uid,
+            reviewed_at: Utc::now().timestamp(),
+            rating: 3,
+            answer_correct: Some(true),
+            response_ms: 500,
+        };
+
+        assert_eq!(
+            db.import_review_events(std::slice::from_ref(&event), 0.9)
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.import_review_events(&[event], 0.9).unwrap(), 0);
+        assert_eq!(db.statistics().unwrap().reviewed_today, 1);
+    }
+
+    #[test]
+    fn scopes_reviews_by_deck_and_can_force_non_due_cards() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("test.md"),
+            "# Test {#root}\n\n```quiz\nid: assigned\ntype: cloze\nprompt: '{{c1::deck}}'\n```\n\n```quiz\nid: loose\ntype: cloze\nprompt: '{{c1::alone}}'\n```\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        db.create_deck("Exam").unwrap();
+        let deck = db.decks().unwrap().remove(0);
+        let rows = db.card_rows().unwrap();
+        let assigned = rows
+            .iter()
+            .find(|card| card.label.ends_with("assigned"))
+            .unwrap();
+        db.toggle_card_deck(assigned.id, deck.id).unwrap();
+
+        let deck_cards = db
+            .review_cards(
+                ReviewScope::Deck(deck.id),
+                false,
+                20,
+                200,
+                ReviewOrder::Due,
+                false,
+            )
+            .unwrap();
+        let deckless_cards = db
+            .review_cards(
+                ReviewScope::Deckless,
+                false,
+                20,
+                200,
+                ReviewOrder::Due,
+                false,
+            )
+            .unwrap();
+        assert_eq!(deck_cards.len(), 1);
+        assert_eq!(deck_cards[0].id, assigned.id);
+        assert_eq!(deckless_cards.len(), 1);
+        assert_ne!(deckless_cards[0].id, assigned.id);
+
+        db.record_review(&deck_cards[0], 3, Some(true), 100, None, 0.9)
+            .unwrap();
+        assert!(
+            db.review_cards(
+                ReviewScope::Deck(deck.id),
+                false,
+                20,
+                200,
+                ReviewOrder::Due,
+                false,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            db.review_cards(
+                ReviewScope::Deck(deck.id),
+                true,
+                20,
+                200,
+                ReviewOrder::Due,
+                false,
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        let snapshot = db
+            .mobile_snapshot(20, 200, ReviewOrder::Due, false)
+            .unwrap();
+        assert_eq!(snapshot.protocol_version, 2);
+        assert_eq!(snapshot.decks.len(), 1);
+        let assigned = snapshot
+            .cards
+            .iter()
+            .find(|card| card.card.id == assigned.id)
+            .unwrap();
+        assert_eq!(assigned.deck_ids, vec![deck.id]);
+        assert!(assigned.due_deck_ids.is_empty());
+        assert!(snapshot.cards.iter().any(|card| card.deck_ids.is_empty()));
     }
 
     #[test]

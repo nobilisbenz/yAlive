@@ -104,14 +104,15 @@ fn main() -> Result<()> {
         Some(Command::Sync { repo }) => {
             let summary = sync::sync(&vault, repo.as_deref())?;
             println!(
-                "synced {} on {}{}",
+                "synced {} on {}{}; imported {} mobile review(s)",
                 summary.remote,
                 summary.branch,
                 if summary.committed {
                     " (committed local changes)"
                 } else {
                     ""
-                }
+                },
+                summary.imported_reviews,
             );
             Ok(())
         }

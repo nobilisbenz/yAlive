@@ -4,6 +4,10 @@ use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
 
+use crate::config::Config;
+use crate::db::Database;
+use crate::model::ReviewEvent;
+
 const IGNORE_ENTRIES: &[&str] = &[
     "/.notes/index.sqlite",
     "/.notes/index.sqlite-shm",
@@ -17,6 +21,7 @@ pub struct SyncSummary {
     pub remote: String,
     pub branch: String,
     pub committed: bool,
+    pub imported_reviews: usize,
 }
 
 pub fn remote(vault: &Path) -> Option<String> {
@@ -47,8 +52,10 @@ pub fn sync(vault: &Path, repository: Option<&str>) -> Result<SyncSummary> {
         .context("no Git remote configured; provide a repository URL in Options or with --repo")?;
     validate_remote(&remote)?;
 
+    let mut imported_reviews = 0;
+
     run_git(vault, &["add", "--all"])?;
-    let committed = !git_success(vault, &["diff", "--cached", "--quiet"])?;
+    let mut committed = !git_success(vault, &["diff", "--cached", "--quiet"])?;
     if committed {
         run_git(vault, &["commit", "-m", "Sync yalive vault"])
             .context("could not commit; configure Git user.name and user.email")?;
@@ -88,13 +95,54 @@ pub fn sync(vault: &Path, repository: Option<&str>) -> Result<SyncSummary> {
         }
     }
 
+    imported_reviews += prepare_mobile_files(vault)?;
+    run_git(vault, &["add", "--all"])?;
+    if !git_success(vault, &["diff", "--cached", "--quiet"])? {
+        run_git(vault, &["commit", "-m", "Sync mobile reviews"])
+            .context("could not commit mobile review updates")?;
+        committed = true;
+    }
+
     let refspec = format!("HEAD:{branch}");
     run_git(vault, &["push", "--set-upstream", "origin", &refspec])?;
     Ok(SyncSummary {
         remote,
         branch,
         committed,
+        imported_reviews,
     })
+}
+
+fn prepare_mobile_files(vault: &Path) -> Result<usize> {
+    let config = Config::load(vault)?;
+    let mut database = Database::open(vault)?;
+    database.index_vault(vault)?;
+    let reviews_dir = vault.join(".notes/mobile-reviews");
+    fs::create_dir_all(&reviews_dir)?;
+    let mut events = Vec::new();
+    for entry in fs::read_dir(&reviews_dir)? {
+        let entry = entry?;
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let source = fs::read_to_string(entry.path())?;
+        for line in source.lines().filter(|line| !line.trim().is_empty()) {
+            if let Ok(event) = serde_json::from_str::<ReviewEvent>(line) {
+                events.push(event);
+            }
+        }
+    }
+    let imported = database.import_review_events(&events, config.desired_retention)?;
+    let snapshot = database.mobile_snapshot(
+        config.new_cards_per_day,
+        config.max_reviews_per_day,
+        config.review_order,
+        config.bury_siblings,
+    )?;
+    let path = vault.join(".notes/mobile-snapshot.json");
+    fs::write(&path, serde_json::to_vec_pretty(&snapshot)?)
+        .with_context(|| format!("writing {}", path.display()))?;
+    Ok(imported)
 }
 
 fn ensure_repository(vault: &Path) -> Result<()> {

@@ -321,7 +321,7 @@ pub fn relation_capabilities() -> Vec<RelationCapability> {
     ]
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReviewCard {
     pub id: i64,
     pub uid: String,
@@ -332,6 +332,13 @@ pub struct ReviewCard {
     pub difficulty: Option<f32>,
     pub last_review_at: Option<i64>,
     pub review_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewScope {
+    All,
+    Deck(i64),
+    Deckless,
 }
 
 #[derive(Debug, Clone)]
@@ -398,7 +405,7 @@ pub enum ArchivedItem {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Statistics {
     pub note_count: usize,
     pub topic_count: usize,
@@ -415,6 +422,41 @@ pub struct Statistics {
     pub daily_reviews: Vec<(i64, usize)>,
     pub due_forecast: Vec<(i64, usize)>,
     pub weak_notes: Vec<(String, usize, f64)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReviewEvent {
+    pub event_id: String,
+    pub device_id: String,
+    pub card_uid: String,
+    pub reviewed_at: i64,
+    pub rating: u32,
+    pub answer_correct: Option<bool>,
+    pub response_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileDeck {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileCard {
+    #[serde(flatten)]
+    pub card: ReviewCard,
+    pub deck_ids: Vec<i64>,
+    pub due_deck_ids: Vec<i64>,
+    pub due_without_deck: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileSnapshot {
+    pub protocol_version: u32,
+    pub generated_at: i64,
+    pub decks: Vec<MobileDeck>,
+    pub cards: Vec<MobileCard>,
+    pub statistics: Statistics,
 }
 
 pub fn validate_quiz(quiz: &QuizDefinition) -> Vec<String> {

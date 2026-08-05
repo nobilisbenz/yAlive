@@ -27,7 +27,7 @@ use crate::config::{Config, ReviewOrder};
 use crate::db::Database;
 use crate::model::{
     ArchivedItem, CardContent, CardRow, ChoiceMode, DeckRow, GapDefinition, NoteRow, RelationRow,
-    ReviewCard, ReviewSectionRow, SectionRow, Statistics,
+    ReviewCard, ReviewScope, ReviewSectionRow, SectionRow, Statistics,
 };
 use crate::sync;
 
@@ -41,6 +41,7 @@ enum Mode {
     NoteInput,
     VaultInput,
     GitRemoteInput,
+    ReviewDeckChoice,
     Review,
 }
 
@@ -168,6 +169,7 @@ pub struct App {
     selected: usize,
     scroll: u16,
     active_deck: usize,
+    review_scope_selected: usize,
     page: Page,
     focused_panel: usize,
     relation_section: usize,
@@ -212,6 +214,7 @@ impl App {
             selected: 0,
             scroll: 0,
             active_deck: 0,
+            review_scope_selected: 0,
             page: Page::Dashboard,
             focused_panel: 0,
             relation_section: 0,
@@ -339,6 +342,7 @@ impl App {
             Mode::NoteInput => self.handle_note_input(key, terminal),
             Mode::VaultInput => self.handle_vault_input(key),
             Mode::GitRemoteInput => self.handle_git_remote_input(key),
+            Mode::ReviewDeckChoice => self.handle_review_deck_choice(key),
             Mode::Review => self.handle_review(key),
         }
     }
@@ -398,16 +402,10 @@ impl App {
                 }
             }
             KeyCode::Char('r') if self.page == Page::Reviews => {
-                let cards = self.db.due_cards(
-                    self.config.new_cards_per_day,
-                    self.config.max_reviews_per_day,
-                    self.config.review_order,
-                    self.config.bury_siblings,
-                )?;
-                let count = cards.len();
-                self.review = Some(ReviewSession::new(cards));
-                self.mode = Mode::Review;
-                self.status = format!("{count} cards due");
+                self.review_scope_selected =
+                    self.active_deck.saturating_add(1).min(self.decks.len());
+                self.mode = Mode::ReviewDeckChoice;
+                self.status = "Choose a deck: Enter reviews due cards, f forces all cards".into();
             }
             KeyCode::Char(' ') if self.page == Page::Reviews => self.toggle_selected_section()?,
             KeyCode::Char('n') if self.page == Page::Reviews => {
@@ -452,6 +450,52 @@ impl App {
             _ => {}
         }
         Ok(false)
+    }
+
+    fn handle_review_deck_choice(&mut self, key: KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Browse;
+                self.set_page_status();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.review_scope_selected = (self.review_scope_selected + 1).min(self.decks.len());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.review_scope_selected = self.review_scope_selected.saturating_sub(1);
+            }
+            KeyCode::Enter | KeyCode::Char('r') => self.start_scoped_review(false)?,
+            KeyCode::Char('f') => self.start_scoped_review(true)?,
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    fn start_scoped_review(&mut self, force: bool) -> Result<()> {
+        let (scope, name) = if self.review_scope_selected == 0 {
+            (ReviewScope::Deckless, "No deck".to_string())
+        } else if let Some(deck) = self.decks.get(self.review_scope_selected - 1) {
+            (ReviewScope::Deck(deck.id), deck.name.clone())
+        } else {
+            return Ok(());
+        };
+        let cards = self.db.review_cards(
+            scope,
+            force,
+            self.config.new_cards_per_day,
+            self.config.max_reviews_per_day,
+            self.config.review_order,
+            self.config.bury_siblings,
+        )?;
+        let count = cards.len();
+        self.review = Some(ReviewSession::new(cards));
+        self.mode = Mode::Review;
+        self.status = if force {
+            format!("force reviewing {count} cards from {name}")
+        } else {
+            format!("{count} cards due in {name}")
+        };
+        Ok(())
     }
 
     fn handle_search(&mut self, key: KeyEvent, terminal: &mut Tui) -> Result<bool> {
@@ -993,7 +1037,7 @@ impl App {
         self.status = match self.page {
             Page::Dashboard => "[1-7] pages  Enter open  n new note  / search  Ctrl+s sync",
             Page::Reviews => {
-                "[1-7] pages  r review due  Space enroll  a assign  x archive  Ctrl+s sync"
+                "[1-7] pages  r choose review deck  Space enroll  a assign  x archive  Ctrl+s sync"
             }
             Page::Relations => "[1-7] pages  j/k select  Enter follow/open  Ctrl+s sync",
             Page::Statistics => "[1-7] pages  j/k scroll  Ctrl+s sync",
@@ -1485,6 +1529,7 @@ impl App {
         frame.render_widget(Paragraph::new(tabs), areas[0]);
         match self.mode {
             Mode::Review => self.draw_review(frame, areas[1]),
+            Mode::ReviewDeckChoice => self.draw_review_deck_choice(frame, areas[1]),
             Mode::Search => self.draw_browse(frame, areas[1]),
             _ => match self.page {
                 Page::Dashboard => self.draw_dashboard(frame, areas[1]),
@@ -1828,6 +1873,30 @@ impl App {
                 .block(focused_block(title, self.focused_panel == 1))
                 .wrap(Wrap { trim: false }),
             columns[1],
+        );
+    }
+
+    fn draw_review_deck_choice(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let deckless = self
+            .cards
+            .iter()
+            .filter(|card| card.decks.is_empty())
+            .count();
+        let mut items = vec![ListItem::new(format!("No deck  {deckless} cards"))];
+        items.extend(
+            self.decks
+                .iter()
+                .map(|deck| ListItem::new(format!("{}  {} cards", deck.name, deck.card_count))),
+        );
+        let mut state = ListState::default().with_selected(Some(self.review_scope_selected));
+        let height = (items.len() as u16).saturating_add(6).min(area.height);
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(review_block(" Choose a deck "))
+                .highlight_style(selected_style())
+                .highlight_symbol("> "),
+            centered_card(area, 64, height),
+            &mut state,
         );
     }
 
@@ -3220,6 +3289,8 @@ mod tests {
             app.page = page;
             terminal.draw(|frame| app.draw(frame)).unwrap();
         }
+        app.mode = Mode::ReviewDeckChoice;
+        terminal.draw(|frame| app.draw(frame)).unwrap();
     }
 
     #[test]

@@ -28,6 +28,39 @@ The Options tab includes the complete setup flow: authenticate with GitHub CLI, 
 
 Sync commits local changes, fetches and integrates the remote branch, and pushes. Conflicts stop without overwriting either side. Use a standalone vault directory, not a directory nested inside another Git repository. The disposable SQLite index and graph IPC files are automatically ignored; Markdown, images, configuration, and portable review exports are synced.
 
+### Android Reviewer
+
+[`yreviewy/`](yreviewy/) is a Tauri v2 Android companion for reviewing from a phone. It reads a compact, versioned card snapshot through the GitHub Contents API, works from that snapshot offline, and appends reviews to a device-specific mailbox in the vault:
+
+```text
+.notes/mobile-snapshot.json
+.notes/mobile-reviews/<device-id>.jsonl
+```
+
+The SQLite database is never uploaded. Review events have stable IDs and desktop imports are idempotent, so retrying a phone sync is safe. Each phone owns one append-only mailbox file, avoiding Git conflicts between devices. A desktop `sync` imports GitHub review events into FSRS and statistics, then publishes a fresh snapshot containing desktop and mobile progress.
+
+1. Sync the vault once from the PC to create and publish the mobile snapshot:
+
+```bash
+cargo run -- --vault ~/Notes sync
+```
+
+2. Create a classic GitHub personal access token. Use the `repo` scope for a private vault repository or `public_repo` for a public repository. The phone needs Contents read/write access because it reads the snapshot and writes its review mailbox.
+
+3. Install Android Studio, its SDK/NDK, and the Android Rust targets required by [Tauri mobile prerequisites](https://v2.tauri.app/start/prerequisites/). Then initialize and run the app:
+
+```bash
+cd yreviewy
+npm install
+cargo check --manifest-path src-tauri/Cargo.toml
+npm run tauri android init
+npm run tauri android dev
+```
+
+Use `npm run tauri android build` for an APK/AAB. On first launch, enter `owner/repository`, the branch, and the classic token. The token is kept in Android app-private Rust storage and is never exposed to the web view, snapshot, or review mailbox. Revoke the token from GitHub if the phone is lost.
+
+The normal rhythm is: review offline on either device, sync the phone to upload its mailbox, then run desktop sync to import those events and publish current cards and statistics. A second phone sync receives the refreshed state. The phone groups cards by deck, keeps cards without a deck in a separate No deck group, and offers Force all when you want to repeat a deck before its cards are due.
+
 ### ygraphy
 
 `ygraphy/` is a native Rust/wgpu graph for the same vault. Sections are connected by their typed relations. Soft force constraints cluster sections inside notes and notes inside topics, while fitted circles make the `topic -> note -> section` hierarchy visible.
@@ -58,8 +91,9 @@ yalive --vault ~/Notes editor diagnostics
 | Dashboard | `g` or `b` relations/backlinks, `o` opens URL, `i` opens image |
 | Archive | `x` archives the selected note, section, quiz, or deck; `u` restores it on the archived page |
 | Review setup | `Enter` opens notes/sections, activates decks, or reviews cards |
-| Review setup | `Space` enrolls a section, `r` reviews due cards, `n` creates a deck |
+| Review setup | `Space` enrolls a section, `r` chooses a deck to review, `n` creates a deck |
 | Review setup | `[`/`]` choose active deck, `a` assign card, `x` archive selected item |
+| Deck review | `Enter` reviews due cards, `f` force-reviews every card even when not due; deckless cards are grouped under No deck |
 | Refresh | `Shift+r` reloads Markdown and SQLite-backed lists immediately |
 | Sync | `Ctrl+s` syncs the vault from any page or mode |
 | Relations | `j/k` selects in the focused panel, `Enter` follows incoming/outgoing links or opens the center section |
