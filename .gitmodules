@@ -4,3 +4,6 @@
 [submodule "yReviewy"]
 	path = yReviewy
 	url = git@github.com:nobilisbenz/yReviewy.git
+[submodule "yy"]
+	path = yy
+	url = git@github.com:nobilisbenz/yy.git
