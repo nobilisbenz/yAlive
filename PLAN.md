@@ -32,16 +32,27 @@ against a 100 ms target. That number says the pipeline is not doing anything stu
 does not say what happens at 40k sections. Growing the corpus by another order of magnitude
 is still the thing that would make §3.2 falsifiable.
 
-The measured hardware ceiling still says where the remaining time will go:
+Generation is now measured rather than predicted, and it came in far better than this
+document assumed:
 
 ```
-prefill    6555 t/s   →  ~310 ms for a 2000-token context pack
-generate    168 t/s   →  ~2100 ms for a 350-token answer
-retrieval   (measured)     0.4 ms
+                        predicted here          measured (Phase C)
+prefill / TTFT          ~310 ms                 24 ms p50, 42 ms p99
+generation              ~2100 ms (350 tok)      ~600 ms (~90 tok at 155.6 tok/s)
+retrieval               91 ms (mock)            0.4 ms
+total                   ~2.5 s                  288 ms p50, 703 ms p99
 ```
 
-**Retrieval is now a rounding error. Generation is the entire budget.** Section 4 is
-ordered accordingly, and Phase C is where the wall-clock wins are.
+The prediction was wrong in two places, both worth keeping in mind. **Prefill effectively
+disappeared** — a byte-identical prompt prefix plus `--cache-reuse 256` means the ~2000-token
+context pack is prefilled once per session, not once per query, so the 310 ms estimate only
+describes the *first* query (measured: 182 ms). And **the answer is a third of the assumed
+length**, because the three-sentence contract was adopted; 350 tokens was never a target, it
+was a cap.
+
+**Everything is now a rounding error next to a 288 ms total.** The consequence is that the
+remaining latency ideas in §3.1 — chiefly speculative decoding — are optimising a path that
+is already fast, and should be judged on that basis rather than on the numbers above them.
 
 ---
 
@@ -463,9 +474,10 @@ now stored on `sections`, computed from the parser's existing heading stack.
     retrieval-only query in ~0.4 ms. **Search-as-you-type is still not wired in the dock** —
     it sends on Enter.
 16. ✅ `tracing` spans per stage + `brainctl bench` with p50/p99.
-17. ⬜ **Provenance rows + one keystroke to rate an answer** (§6.3) — this replaces
-    hand-labelling the benchmark set. Land it early so the data accumulates while you build
-    Phases C and D.
+17. ✅ **Provenance rows + one keystroke to rate an answer** (§6.3). Every answer records
+    its query, the `section_uid`s packed into the prompt, and the model; `Ctrl+G` / `Ctrl+B`
+    in the dock rate it, and `brainctl status` reports how many rows have accumulated. The
+    rated rows *are* the Phase D benchmark, built from questions actually asked.
 
 *Also landed here, because retrieval needed them:* config loading and validation
 (all problems reported at once, `$HOME` and `/` refused), front-matter `status:` parsed and
@@ -474,11 +486,43 @@ wired to `[search.status_weight]` — it had been configuring nothing — the fi
 `brainctl sources` / `doctor` / `bench`. Graph expansion is on by default and visibly
 working: `1 hop back to related` shows up in real results.
 
-### Phase C — `yy` Stage 2, LLM
-18. Prefix-stable prompt + `--cache-reuse`.
-19. Speculative decoding with Qwen3-0.6B draft — measure, keep if it wins.
-20. `max_output_tokens` → 200, two-to-three-sentence contract.
-21. Warm-up request on daemon start.
+### Phase C — `yy` Stage 2, LLM — **the DoD passes**
+18. ✅ Prefix-stable prompt + `--cache-reuse 256`. The system block is a `const` and the
+    retrieved context comes strictly after it; a test asserts the prefix never varies,
+    because losing it costs a full reprefill per query and nothing fails visibly.
+19. 🟨 Speculative decoding — **not measured, and the case for it has weakened.** See the
+    numbers below: it was sized against a predicted 2.1 s of generation, and generation is
+    now ~600 ms.
+20. ✅ `max_output_tokens` → 200 with a three-sentence contract.
+21. ✅ Warm-up request on daemon start, sending the real system block so the first query
+    reuses the cached prefix too.
+
+Measured, Qwen3-1.7B Q5_K_M on CUDA, 50-note vault:
+
+```text
+TTFT        p50  24 ms   p99  42 ms     (target < 500 ms; first query of a session: 182 ms)
+generation          155.6 tok/s         (llama-bench ceiling 168 t/s)
+total       p50 288 ms   p99 703 ms
+```
+
+*Also landed:* llama-server supervision with health checks and backoff restart (a killed
+server is detected within 5 s and back in ~1.3 s), the confidence gate that decides
+no-answer **before** the model is called, `<think>` stripping as a third line of defence,
+degradation to lexical-only with the sources still on screen, and `brainctl bench
+--generate`.
+
+*Also landed:* the answer cache, keyed on a hash of the packed sections' bodies plus model,
+prompt version, and generation params. A repeated question drops **618 ms → 3 ms** and
+renders whole rather than replayed. Editing a note that fed an answer regenerates it;
+appending an unrelated section does not. Both verified.
+
+The store holding it is `yy`'s own SQLite at `$XDG_DATA_HOME/brain/brain.sqlite` — the
+second store §2.2 anticipated. Deliberately not in the vault's `.notes/`, which `yalive`
+owns and rebuilds from the Markdown whenever its schema changes; answers and provenance
+would be lost by exactly that rebuild.
+
+*Still open:* the in-memory retrieval cache. Retrieval is 0.4 ms, so it would save nothing
+measurable.
 
 ### Phase D — graph retrieval
 22. Precompute `rank` and `community_id` during indexing.
