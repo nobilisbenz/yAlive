@@ -1,6 +1,8 @@
 pub mod app;
 pub mod config;
 pub mod db;
+pub mod graph;
 pub mod model;
 pub mod parser;
+pub mod search;
 pub mod sync;

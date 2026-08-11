@@ -22,7 +22,20 @@ struct FrontMatter {
     topic: Option<String>,
     #[serde(default, alias = "pin")]
     pinned: bool,
+    /// `current` (the default) | `draft` | `archived` | `obsolete`.
+    ///
+    /// A ranking signal rather than a display one: a vault that accumulates years of
+    /// how-tos needs superseded workflows to sink, or the answer blends the way you do
+    /// something now with the way you stopped doing it in 2023.
+    status: Option<String>,
 }
+
+/// What joins ancestor headings in `ParsedSection::heading_path`.
+///
+/// Shown to the user under every retrieved source, so it is a display decision as much as
+/// a storage one — and it must not be a character that appears in headings, or the path
+/// cannot be split back apart.
+pub const HEADING_PATH_SEPARATOR: &str = " > ";
 
 struct HeadingDraft {
     heading: String,
@@ -84,11 +97,17 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
     }
 
     let quiz_blocks = collect_quiz_blocks(&source, markdown_offset, relative, &mut diagnostics);
+    // `supersedes` separates *valid* time from *recorded* time: it marks the section this
+    // one replaces, so retrieval can demote a workflow you abandoned in favour of the one
+    // that replaced it. Ranking treats it like any other typed edge, so adding it here is
+    // the whole feature.
     let relation_re = Regex::new(
-        r"(?m)(?:(outgoing|contradicts|example-of|ingoing)::\s*)?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]",
+        r"(?m)(?:(outgoing|contradicts|example-of|ingoing|supersedes)::\s*)?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]",
     )?;
     let mut sections = Vec::new();
-    let mut stack: Vec<(u32, String)> = Vec::new();
+    // level, uid, heading — the heading is carried so `heading_path` falls out of the
+    // stack we already maintain for `parent_uid`.
+    let mut stack: Vec<(u32, String, String)> = Vec::new();
     let mut quiz_ids = HashSet::new();
     for (position, heading) in headings.iter().enumerate() {
         let end = headings
@@ -98,12 +117,18 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
         let uid = format!("{note_id}#{section_id}");
         while stack
             .last()
-            .is_some_and(|(level, _)| *level >= heading.level)
+            .is_some_and(|(level, _, _)| *level >= heading.level)
         {
             stack.pop();
         }
-        let parent_uid = stack.last().map(|(_, uid)| uid.clone());
-        stack.push((heading.level, uid.clone()));
+        let parent_uid = stack.last().map(|(_, uid, _)| uid.clone());
+        let heading_path = stack
+            .iter()
+            .map(|(_, _, ancestor)| ancestor.as_str())
+            .chain(std::iter::once(heading.heading.as_str()))
+            .collect::<Vec<_>>()
+            .join(HEADING_PATH_SEPARATOR);
+        stack.push((heading.level, uid.clone(), heading.heading.clone()));
         let body = source[heading.start..end].to_string();
         let relations = relation_re
             .captures_iter(&body)
@@ -145,6 +170,7 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
             uid,
             parent_uid,
             heading: heading.heading.clone(),
+            heading_path,
             level: heading.level,
             start_byte: heading.start,
             end_byte: end,
@@ -163,6 +189,7 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
         tags: front.tags,
         topic: front.topic,
         pinned: front.pinned,
+        status: front.status,
         created_at,
         content_hash,
         modified_at,
@@ -471,6 +498,46 @@ gaps:
         assert_eq!(note.sections[1].relations[2].relation_type, "ingoing");
         assert_eq!(note.sections[1].cards.len(), 4);
         assert!(note.diagnostics.is_empty(), "{:?}", note.diagnostics);
+    }
+
+    #[test]
+    fn heading_path_names_every_ancestor_and_supersedes_is_a_relation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("obs.md");
+        fs::write(
+            &path,
+            r#"---
+id: obs
+---
+# OBS {#root}
+## Cursor follow {#follow}
+### Smoothing {#smoothing}
+supersedes:: [[obs#old-smoothing]]
+## Scenes {#scenes}
+"#,
+        )
+        .unwrap();
+        let note = parse_note(&path, dir.path()).unwrap();
+
+        let paths: Vec<&str> = note
+            .sections
+            .iter()
+            .map(|section| section.heading_path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "OBS",
+                "OBS > Cursor follow",
+                "OBS > Cursor follow > Smoothing",
+                // Back out to depth 2: the H3 must not stay on the stack.
+                "OBS > Scenes",
+            ]
+        );
+
+        let smoothing = &note.sections[2];
+        assert_eq!(smoothing.relations[0].relation_type, "supersedes");
+        assert_eq!(smoothing.relations[0].target_uid, "obs#old-smoothing");
     }
 
     #[test]

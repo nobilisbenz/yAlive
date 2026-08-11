@@ -14,6 +14,7 @@ use crate::model::{
     ReviewCard, ReviewEvent, ReviewScope, ReviewSectionRow, SectionRow, Statistics,
 };
 use crate::parser::{markdown_files, parse_note};
+use crate::search::Bm25Weights;
 
 pub struct Database {
     connection: Connection,
@@ -26,8 +27,19 @@ impl Database {
         let connection = Connection::open(notes_dir.join("index.sqlite"))?;
         connection.busy_timeout(std::time::Duration::from_secs(3))?;
         connection.execute_batch(
+            // PRAGMAs are per-connection, not per-database, so every one of these has to
+            // be set here rather than once at creation.
+            //
+            // `synchronous = NORMAL` is the correct pairing with WAL: FULL costs an fsync
+            // per commit, and the durability it buys back is only against OS crashes —
+            // WAL already survives a process crash. On a reindex that writes a row per
+            // section, the difference is the whole runtime.
             "PRAGMA foreign_keys = ON;
              PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA cache_size   = -32000;
+             PRAGMA temp_store   = MEMORY;
+             PRAGMA mmap_size    = 268435456;
              CREATE TABLE IF NOT EXISTS files (
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
@@ -46,6 +58,7 @@ impl Database {
                 file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
                 parent_uid TEXT,
                 heading TEXT NOT NULL,
+                heading_path TEXT NOT NULL DEFAULT '',
                 heading_level INTEGER NOT NULL,
                 start_byte INTEGER NOT NULL,
                 end_byte INTEGER NOT NULL,
@@ -117,9 +130,19 @@ impl Database {
                 line INTEGER NOT NULL,
                 message TEXT NOT NULL
              );
-             CREATE VIRTUAL TABLE IF NOT EXISTS section_search USING fts5(
-                section_uid UNINDEXED, note_title, heading, body, tags
-             );",
+             -- `section_search` is not here: it is external-content FTS5 and its shape
+             -- can change, so `migrate_search` owns creating and rebuilding it.
+             --
+             -- Everything below rides on primary keys otherwise.
+             --
+             -- `relations` has PK (source_section_id, target_section_uid, relation_type),
+             -- so forward traversal is covered and **reverse traversal is a full table
+             -- scan**. Backlinks are half of graph expansion, so that scan would land
+             -- once per hop per query in the interactive path.
+             CREATE INDEX IF NOT EXISTS relations_target ON relations(target_section_uid);
+             CREATE INDEX IF NOT EXISTS sections_file    ON sections(file_id);
+             CREATE INDEX IF NOT EXISTS sections_parent  ON sections(parent_uid);
+             CREATE INDEX IF NOT EXISTS cards_section    ON cards(section_uid);",
         )?;
         add_column(&connection, "files", "topic", "TEXT")?;
         add_column(&connection, "files", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
@@ -130,13 +153,21 @@ impl Database {
             "INTEGER NOT NULL DEFAULT 0",
         )?;
         add_column(&connection, "files", "archived_at", "INTEGER")?;
+        add_column(&connection, "files", "status", "TEXT")?;
         add_column(&connection, "sections", "archived_at", "INTEGER")?;
+        // Denormalised from the parser's heading stack rather than derived with a
+        // recursive CTE at read time: it is shown on every retrieved source, so it is
+        // read far more often than it is written, and the write already has the stack
+        // in hand.
+        add_column(&connection, "sections", "heading_path", "TEXT NOT NULL DEFAULT ''")?;
         add_column(&connection, "cards", "archived_at", "INTEGER")?;
         add_column(&connection, "decks", "archived_at", "INTEGER")?;
         connection.execute(
             "UPDATE files SET created_at=modified_at WHERE created_at=0",
             [],
         )?;
+        // After `add_column`, because the search index reads `sections.heading_path`.
+        migrate_search(&connection)?;
         Ok(Self { connection })
     }
 
@@ -227,12 +258,13 @@ impl Database {
         let transaction = self.connection.transaction()?;
         let path = note.path.to_string_lossy();
         transaction.execute(
-            "INSERT INTO files(path, note_id, title, tags, content_hash, modified_at, topic, pinned, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO files(path, note_id, title, tags, content_hash, modified_at, topic, pinned, created_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(note_id) DO UPDATE SET
                 path=excluded.path, title=excluded.title, tags=excluded.tags,
                 content_hash=excluded.content_hash, modified_at=excluded.modified_at,
-                topic=excluded.topic, pinned=excluded.pinned, created_at=excluded.created_at",
+                topic=excluded.topic, pinned=excluded.pinned, created_at=excluded.created_at,
+                status=excluded.status",
             params![
                 path,
                 note.note_id,
@@ -242,7 +274,8 @@ impl Database {
                 note.modified_at,
                 note.topic,
                 note.pinned,
-                note.created_at
+                note.created_at,
+                note.status
             ],
         )?;
         let file_id: i64 = transaction.query_row(
@@ -257,12 +290,13 @@ impl Database {
             .collect();
         for section in &note.sections {
             transaction.execute(
-                "INSERT INTO sections(section_uid, file_id, parent_uid, heading, heading_level,
-                    start_byte, end_byte, start_line, position, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "INSERT INTO sections(section_uid, file_id, parent_uid, heading, heading_path,
+                    heading_level, start_byte, end_byte, start_line, position, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(section_uid) DO UPDATE SET
                     file_id=excluded.file_id, parent_uid=excluded.parent_uid,
-                    heading=excluded.heading, heading_level=excluded.heading_level,
+                    heading=excluded.heading, heading_path=excluded.heading_path,
+                    heading_level=excluded.heading_level,
                     start_byte=excluded.start_byte, end_byte=excluded.end_byte,
                     start_line=excluded.start_line, position=excluded.position, body=excluded.body",
                 params![
@@ -270,6 +304,7 @@ impl Database {
                     file_id,
                     section.parent_uid,
                     section.heading,
+                    section.heading_path,
                     section.level,
                     section.start_byte,
                     section.end_byte,
@@ -294,19 +329,8 @@ impl Database {
                     params![section_id, relation.target_uid, relation.relation_type, relation.context],
                 )?;
             }
-            transaction.execute("DELETE FROM section_search WHERE rowid = ?1", [section_id])?;
-            transaction.execute(
-                "INSERT INTO section_search(rowid, section_uid, note_title, heading, body, tags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    section_id,
-                    section.uid,
-                    note.title,
-                    section.heading,
-                    section.body,
-                    note.tags.join(" ")
-                ],
-            )?;
+            // The search index is maintained by trigger (see `SEARCH_SCHEMA`), so the
+            // section upsert above has already updated it.
             let card_uids: HashSet<_> =
                 section.cards.iter().map(|card| card.uid.as_str()).collect();
             for card in &section.cards {
@@ -377,9 +401,55 @@ impl Database {
         Ok(())
     }
 
+    /// Fetch specific sections by `section_uid`.
+    ///
+    /// Graph expansion works in node indices and knows only a section's uid and heading, so
+    /// anything it reaches has to be resolved to a full row before it can be shown or
+    /// packed into a prompt. Returned in no particular order — the caller has its own
+    /// ranking and would only have to undo one imposed here.
+    pub fn sections_by_uids(&self, uids: &[String]) -> Result<Vec<SectionRow>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `IN` with a generated placeholder list rather than one query per uid: expansion
+        // routinely reaches tens of sections and this is on the interactive path.
+        let placeholders = std::iter::repeat_n("?", uids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT s.section_uid, f.title, s.heading, s.heading_path, s.body, f.path,
+                    s.start_line, f.status
+             FROM sections s JOIN files f ON f.id=s.file_id
+             WHERE s.section_uid IN ({placeholders})
+               AND s.archived_at IS NULL AND f.archived_at IS NULL"
+        );
+        self.query_sections(&sql, rusqlite::params_from_iter(uids))
+    }
+
+    /// How much is indexed, for `brainctl status` and the daemon's status report.
+    ///
+    /// Counts exclude archived rows, so it reports what is actually searchable rather than
+    /// what is stored.
+    pub fn counts(&self) -> Result<Counts> {
+        Ok(Counts {
+            documents: count(
+                &self.connection,
+                "SELECT count(*) FROM files WHERE archived_at IS NULL",
+                [],
+            )?,
+            sections: count(
+                &self.connection,
+                "SELECT count(*) FROM sections s JOIN files f ON f.id=s.file_id
+                 WHERE s.archived_at IS NULL AND f.archived_at IS NULL",
+                [],
+            )?,
+            relations: count(&self.connection, "SELECT count(*) FROM relations", [])?,
+        })
+    }
+
     pub fn sections(&self) -> Result<Vec<SectionRow>> {
         self.query_sections(
-            "SELECT s.section_uid, f.title, s.heading, s.body, f.path, s.start_line
+            "SELECT s.section_uid, f.title, s.heading, s.heading_path, s.body, f.path, s.start_line, f.status
              FROM sections s JOIN files f ON f.id=s.file_id
              WHERE f.archived_at IS NULL AND s.archived_at IS NULL
              ORDER BY lower(f.title), s.position",
@@ -908,24 +978,57 @@ impl Database {
         })
     }
 
+    /// Free-text search over sections, ranked by BM25.
+    ///
+    /// An empty query returns every section, which is what the TUI's unfiltered list wants.
+    /// A query with no searchable token in it at all (`"--"`, `"'''"`) returns nothing —
+    /// deliberately not everything, and deliberately not an error.
     pub fn search(&self, query: &str) -> Result<Vec<SectionRow>> {
         if query.trim().is_empty() {
             return self.sections();
         }
-        let fts_query = query
-            .split_whitespace()
-            .map(|term| format!("\"{}\"*", term.replace('"', "\"\"")))
-            .collect::<Vec<_>>()
-            .join(" AND ");
-        let mut statement = self.connection.prepare(
-            "SELECT s.section_uid, f.title, s.heading, s.body, f.path, s.start_line
+        let Some(expression) = crate::search::expression(query) else {
+            return Ok(Vec::new());
+        };
+        self.search_expression(&expression, Bm25Weights::default(), 100)
+    }
+
+    /// Search with an already-built FTS5 expression and explicit ranking weights.
+    ///
+    /// The primitive behind [`Database::search`], and what `yy` calls: it sweeps the
+    /// weights from config against its retrieval benchmark, so they cannot be literals
+    /// here. Build `expression` with [`crate::search::expression`] — passing user text
+    /// straight in is the crash this API exists to prevent.
+    ///
+    /// `bm25()` returns a **negative** score where more negative is better, so `ORDER BY
+    /// score ASC` is correct and is not a sign error.
+    pub fn search_expression(
+        &self,
+        expression: &str,
+        weights: Bm25Weights,
+        limit: usize,
+    ) -> Result<Vec<SectionRow>> {
+        let [note_title, heading, heading_path, body, tags] = weights.as_array();
+        let mut statement = self.connection.prepare_cached(
+            "SELECT s.section_uid, f.title, s.heading, s.heading_path, s.body, f.path, s.start_line, f.status
              FROM section_search q
              JOIN sections s ON s.id=q.rowid JOIN files f ON f.id=s.file_id
              WHERE section_search MATCH ?1 AND s.archived_at IS NULL AND f.archived_at IS NULL
-             ORDER BY bm25(section_search, 0, 2, 5, 1, 1) LIMIT 100",
+             ORDER BY bm25(section_search, ?2, ?3, ?4, ?5, ?6) LIMIT ?7",
         )?;
         Ok(statement
-            .query_map([fts_query], section_from_row)?
+            .query_map(
+                params![
+                    expression,
+                    note_title,
+                    heading,
+                    heading_path,
+                    body,
+                    tags,
+                    limit as i64
+                ],
+                section_from_row,
+            )?
             .collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1504,9 +1607,11 @@ fn section_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SectionRow> {
         uid: row.get(0)?,
         note_title: row.get(1)?,
         heading: row.get(2)?,
-        body: row.get(3)?,
-        path: PathBuf::from(row.get::<_, String>(4)?),
-        start_line: row.get(5)?,
+        heading_path: row.get(3)?,
+        body: row.get(4)?,
+        path: PathBuf::from(row.get::<_, String>(5)?),
+        start_line: row.get(6)?,
+        status: row.get(7)?,
     })
 }
 
@@ -1555,6 +1660,123 @@ fn delete_stale_cards(
     Ok(())
 }
 
+/// Bump when [`SEARCH_SCHEMA`] changes. Any bump rebuilds the index from `sections`,
+/// which is cheap because the content is never stored in the FTS table to begin with.
+const SEARCH_SCHEMA_VERSION: i64 = 1;
+
+/// The full-text index: external content, kept in sync by triggers.
+///
+/// Two properties are worth stating because both were previously wrong.
+///
+/// **External content.** The FTS table stores only the inverted index and reads column
+/// values back through the `section_content` view. Before this, `section_search` was a
+/// standalone table storing a second copy of every section `body`, hand-synced from two
+/// separate call sites — the arrangement where one code path eventually forgets and search
+/// serves stale rows for weeks with nothing to notice it.
+///
+/// **`tokenchars '_-.'`.** Without it the tokenizer splits `calculate_pivot` into
+/// `calculate` and `pivot`, and `sprite.rs` into `sprite` and `rs`. On a vault that
+/// contains code and filenames that is a large precision loss for one tokenizer option.
+///
+/// The delete triggers are the subtle part. An FTS5 `'delete'` command has to be given the
+/// *exact* values that were originally indexed, or the tokens it fails to match are left
+/// behind pointing at a rowid that no longer exists. Two orderings threaten that, and each
+/// has a trigger here holding it:
+///
+/// - **Deleting a note.** `ON DELETE CASCADE` removes the `files` row *before* the child
+///   `sections` rows, so by the time the section delete trigger runs its subquery for the
+///   title, the title is gone and the delete command supplies `NULL`. `files_bd` deletes
+///   the sections first, while the title is still readable. Note that `integrity-check`
+///   does **not** catch this — the residue is only visible by matching a title token.
+/// - **Retitling a note.** `replace_note` updates `files` before `sections`, so a section
+///   trigger firing afterwards would delete using the *new* title against an index built
+///   with the old one. `section_search_files_au` re-indexes the whole note at the moment
+///   the title changes, using `old.title` for the delete half.
+const SEARCH_SCHEMA: &str = "
+    CREATE VIEW section_content AS
+      SELECT s.id AS rowid, f.title AS note_title, s.heading AS heading,
+             s.heading_path AS heading_path, s.body AS body, f.tags AS tags
+      FROM sections s JOIN files f ON f.id = s.file_id;
+
+    CREATE VIRTUAL TABLE section_search USING fts5(
+        note_title, heading, heading_path, body, tags,
+        content='section_content', content_rowid='rowid',
+        tokenize=\"unicode61 remove_diacritics 2 tokenchars '_-.'\"
+    );
+
+    CREATE TRIGGER files_bd BEFORE DELETE ON files BEGIN
+      DELETE FROM sections WHERE file_id = old.id;
+    END;
+
+    CREATE TRIGGER section_search_ai AFTER INSERT ON sections BEGIN
+      INSERT INTO section_search(rowid, note_title, heading, heading_path, body, tags)
+      VALUES (new.id, (SELECT title FROM files WHERE id = new.file_id), new.heading,
+              new.heading_path, new.body, (SELECT tags FROM files WHERE id = new.file_id));
+    END;
+
+    CREATE TRIGGER section_search_ad AFTER DELETE ON sections BEGIN
+      INSERT INTO section_search(section_search, rowid, note_title, heading, heading_path,
+                                 body, tags)
+      VALUES ('delete', old.id, (SELECT title FROM files WHERE id = old.file_id),
+              old.heading, old.heading_path, old.body,
+              (SELECT tags FROM files WHERE id = old.file_id));
+    END;
+
+    CREATE TRIGGER section_search_au AFTER UPDATE ON sections BEGIN
+      INSERT INTO section_search(section_search, rowid, note_title, heading, heading_path,
+                                 body, tags)
+      VALUES ('delete', old.id, (SELECT title FROM files WHERE id = old.file_id),
+              old.heading, old.heading_path, old.body,
+              (SELECT tags FROM files WHERE id = old.file_id));
+      INSERT INTO section_search(rowid, note_title, heading, heading_path, body, tags)
+      VALUES (new.id, (SELECT title FROM files WHERE id = new.file_id), new.heading,
+              new.heading_path, new.body, (SELECT tags FROM files WHERE id = new.file_id));
+    END;
+
+    CREATE TRIGGER section_search_files_au AFTER UPDATE OF title, tags ON files
+    WHEN old.title IS NOT new.title OR old.tags IS NOT new.tags BEGIN
+      INSERT INTO section_search(section_search, rowid, note_title, heading, heading_path,
+                                 body, tags)
+        SELECT 'delete', s.id, old.title, s.heading, s.heading_path, s.body, old.tags
+        FROM sections s WHERE s.file_id = old.id;
+      INSERT INTO section_search(rowid, note_title, heading, heading_path, body, tags)
+        SELECT s.id, new.title, s.heading, s.heading_path, s.body, new.tags
+        FROM sections s WHERE s.file_id = new.id;
+    END;
+";
+
+/// Create the search index, or rebuild it when its shape has changed.
+///
+/// Rebuilding rather than migrating in place is deliberate: the FTS table is derived data,
+/// so the cheapest correct migration is always to throw it away and re-derive it.
+fn migrate_search(connection: &Connection) -> Result<()> {
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SEARCH_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    connection.execute_batch(
+        "DROP TRIGGER IF EXISTS section_search_ai;
+         DROP TRIGGER IF EXISTS section_search_ad;
+         DROP TRIGGER IF EXISTS section_search_au;
+         DROP TRIGGER IF EXISTS section_search_files_au;
+         DROP TRIGGER IF EXISTS files_bd;
+         DROP TABLE   IF EXISTS section_search;
+         DROP VIEW    IF EXISTS section_content;",
+    )?;
+    connection.execute_batch(SEARCH_SCHEMA)?;
+
+    // Re-derive from the content view in one statement. `rebuild` would do the same, but
+    // spelling it out keeps this working if the table ever becomes contentless.
+    connection.execute_batch(
+        "INSERT INTO section_search(rowid, note_title, heading, heading_path, body, tags)
+           SELECT rowid, note_title, heading, heading_path, body, tags FROM section_content;
+         INSERT INTO section_search(section_search) VALUES('optimize');",
+    )?;
+    connection.execute_batch(&format!("PRAGMA user_version = {SEARCH_SCHEMA_VERSION}"))?;
+    Ok(())
+}
+
 fn add_column(connection: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
     let exists = statement
@@ -1590,11 +1812,19 @@ fn delete_stale_sections(
     for (id, uid) in existing {
         if !keep.contains(uid.as_str()) {
             transaction.execute("DELETE FROM cards WHERE section_uid=?1", [&uid])?;
-            transaction.execute("DELETE FROM section_search WHERE rowid=?1", [id])?;
+            // `section_search_ad` removes the index entry.
             transaction.execute("DELETE FROM sections WHERE id=?1", [id])?;
         }
     }
     Ok(())
+}
+
+/// What the index currently holds, excluding archived rows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Counts {
+    pub documents: usize,
+    pub sections: usize,
+    pub relations: usize,
 }
 
 #[derive(Debug, Default)]
@@ -1675,6 +1905,209 @@ prompt: One {{c1::writer}}.
             &due_card.content,
             CardContent::Section { body, .. } if body.contains("Exclusive")
         )));
+    }
+
+    /// Ask FTS5 itself whether the index still matches its content, and separately look
+    /// for orphaned tokens.
+    ///
+    /// The second half is not redundant. `integrity-check` compares the index against the
+    /// content view, so it passes when a row is missing from *both* — which is exactly what
+    /// a cascade delete used to produce: the section gone from the view, its title tokens
+    /// still in the index pointing at a dead rowid. Matching a term and checking the rowid
+    /// still resolves is the only thing that catches it.
+    fn assert_search_index_is_consistent(db: &Database, orphan_probe: &[&str]) {
+        db.connection
+            .execute_batch("INSERT INTO section_search(section_search) VALUES('integrity-check')")
+            .expect("FTS5 index disagrees with the content view");
+
+        for term in orphan_probe {
+            let expression = crate::search::expression(term).expect("probe term is searchable");
+            let orphans: i64 = db
+                .connection
+                .query_row(
+                    "SELECT count(*) FROM section_search q
+                     LEFT JOIN sections s ON s.id = q.rowid
+                     WHERE section_search MATCH ?1 AND s.id IS NULL",
+                    [&expression],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(orphans, 0, "{term:?} still indexed against a deleted section");
+        }
+    }
+
+    /// The search index survives the whole lifecycle of a note.
+    ///
+    /// Every step here is a case where a hand-synced or naively-triggered index goes stale
+    /// silently and stays stale for weeks, because nothing in normal use reports it.
+    #[test]
+    fn the_search_index_stays_in_sync_across_edits_retitles_and_deletes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("obs.md");
+        fs::write(
+            &path,
+            "---\nid: obs\ntitle: ObsTitle\ntags: [video]\n---\n\
+             # Root {#root}\n## Cursor follow {#follow}\nSmoothtoken the crop.\n\
+             ## Old approach {#old}\nJittertoken.\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert_search_index_is_consistent(&db, &["Smoothtoken"]);
+        assert_eq!(db.search("Smoothtoken").unwrap().len(), 1);
+
+        // Edit a body: the old term must stop matching and the new one must start.
+        fs::write(
+            &path,
+            "---\nid: obs\ntitle: ObsTitle\ntags: [video]\n---\n\
+             # Root {#root}\n## Cursor follow {#follow}\nReplacedtoken the crop.\n\
+             ## Old approach {#old}\nJittertoken.\n",
+        )
+        .unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert_search_index_is_consistent(&db, &["Smoothtoken", "Replacedtoken"]);
+        assert!(db.search("Smoothtoken").unwrap().is_empty(), "stale body");
+        assert_eq!(db.search("Replacedtoken").unwrap().len(), 1);
+
+        // Retitle. The title is indexed per section but stored on `files`, and the update
+        // order means a naive trigger deletes using the new title against an old index.
+        fs::write(
+            &path,
+            "---\nid: obs\ntitle: RetitledNote\ntags: [video]\n---\n\
+             # Root {#root}\n## Cursor follow {#follow}\nReplacedtoken the crop.\n\
+             ## Old approach {#old}\nJittertoken.\n",
+        )
+        .unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert_search_index_is_consistent(&db, &["ObsTitle", "RetitledNote"]);
+        assert!(db.search("ObsTitle").unwrap().is_empty(), "stale title");
+        assert_eq!(db.search("RetitledNote").unwrap().len(), 3);
+
+        // Drop one section from the note.
+        fs::write(
+            &path,
+            "---\nid: obs\ntitle: RetitledNote\ntags: [video]\n---\n\
+             # Root {#root}\n## Cursor follow {#follow}\nReplacedtoken the crop.\n",
+        )
+        .unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert_search_index_is_consistent(&db, &["Jittertoken"]);
+        assert!(db.search("Jittertoken").unwrap().is_empty());
+
+        // Delete the note entirely. The `files` row goes first under `ON DELETE CASCADE`,
+        // which is what leaves title tokens behind without the `files_bd` guard.
+        fs::remove_file(&path).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert_search_index_is_consistent(&db, &["RetitledNote", "Replacedtoken"]);
+        assert!(db.search("RetitledNote").unwrap().is_empty());
+    }
+
+    /// Front-matter `status:` reaches the rows retrieval ranks.
+    ///
+    /// Without this the `[search.status_weight]` block in the config is inert, and a
+    /// workflow marked `obsolete` ranks exactly as high as the note that replaced it.
+    #[test]
+    fn a_notes_status_travels_with_every_section_it_owns() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("old.md"),
+            "---\nid: old\ntitle: Old\nstatus: obsolete\n---\n# Root {#root}\nSharedterm here.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("new.md"),
+            "---\nid: new\ntitle: New\n---\n# Root {#root}\nSharedterm here too.\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        let hits = db.search("Sharedterm").unwrap();
+        assert_eq!(hits.len(), 2);
+        let old = hits.iter().find(|h| h.uid == "old#root").unwrap();
+        let new = hits.iter().find(|h| h.uid == "new#root").unwrap();
+        assert_eq!(old.status.as_deref(), Some("obsolete"));
+        assert_eq!(new.status, None, "an unmarked note has no status, not a default");
+    }
+
+    /// `tokenchars '_-.'` is one tokenizer option with a large effect on a vault holding
+    /// code: without it these are two tokens each and precision collapses.
+    #[test]
+    fn identifiers_and_filenames_stay_single_tokens() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("code.md"),
+            "---\nid: code\ntitle: Code\n---\n# Root {#root}\n\
+             Call calculate_pivot from sprite.rs, not the cursor-follow helper.\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        for term in ["calculate_pivot", "sprite.rs", "cursor-follow"] {
+            assert_eq!(db.search(term).unwrap().len(), 1, "{term} did not match");
+        }
+        // The point of the option: the halves are not independently searchable, so a query
+        // for `pivot` does not drag in every section mentioning a pivot.
+        assert!(db.search("pivot").unwrap().is_empty());
+    }
+
+    /// No user input can make FTS5 raise, checked against a real SQLite.
+    ///
+    /// A raise here is a crash on the interactive path, so string-level assertions about
+    /// the escaping are not enough — the parser has to be the judge.
+    #[test]
+    fn no_query_can_make_the_search_index_raise() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("n.md"),
+            "---\nid: n\ntitle: N\n---\n# Root {#root}\nBody.\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        for query in crate::search::tests::hostile_queries() {
+            for mode in [crate::search::Mode::All, crate::search::Mode::Any] {
+                let Some(expression) = crate::search::expression_with(&query, mode) else {
+                    continue;
+                };
+                let result = db.search_expression(&expression, Bm25Weights::default(), 10);
+                assert!(
+                    result.is_ok(),
+                    "{query:?} in {mode:?} built {expression:?}, which raised {:?}",
+                    result.err()
+                );
+            }
+        }
+    }
+
+    /// An existing vault indexed under the old standalone schema comes back searchable.
+    #[test]
+    fn reopening_rebuilds_the_index_when_the_search_schema_changes() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("n.md"),
+            "---\nid: n\ntitle: N\n---\n# Root {#root}\nUniquetoken body.\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        drop(db);
+
+        // Simulate a database written before this schema version: force the rebuild path
+        // without reindexing any file.
+        let connection = Connection::open(dir.path().join(".notes/index.sqlite")).unwrap();
+        connection.execute_batch("PRAGMA user_version = 0").unwrap();
+        drop(connection);
+
+        let db = Database::open(dir.path()).unwrap();
+        assert_search_index_is_consistent(&db, &["Uniquetoken"]);
+        assert_eq!(
+            db.search("Uniquetoken").unwrap().len(),
+            1,
+            "the index was not rebuilt on open"
+        );
     }
 
     #[test]

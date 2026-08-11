@@ -11,6 +11,8 @@ pub struct ParsedNote {
     pub tags: Vec<String>,
     pub topic: Option<String>,
     pub pinned: bool,
+    /// Front-matter `status:` — `current` | `draft` | `archived` | `obsolete`.
+    pub status: Option<String>,
     pub created_at: i64,
     pub content_hash: String,
     pub modified_at: i64,
@@ -23,6 +25,9 @@ pub struct ParsedSection {
     pub uid: String,
     pub parent_uid: Option<String>,
     pub heading: String,
+    /// This heading and its ancestors, joined by
+    /// [`crate::parser::HEADING_PATH_SEPARATOR`].
+    pub heading_path: String,
     pub level: u32,
     pub start_byte: usize,
     pub end_byte: usize,
@@ -218,9 +223,13 @@ pub struct SectionRow {
     pub uid: String,
     pub note_title: String,
     pub heading: String,
+    /// This heading and its ancestors — `OBS > Cursor follow > Smoothing`.
+    pub heading_path: String,
     pub body: String,
     pub path: PathBuf,
     pub start_line: usize,
+    /// The owning note's front-matter `status:`, for ranking (spec §47).
+    pub status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
