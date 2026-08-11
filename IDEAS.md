@@ -63,13 +63,32 @@ graph        →  two indexed SQL queries
 
 Ranked by payoff over effort. All five are small.
 
-| # | Idea | Effort | Payoff | Lands in |
+| # | Idea | Effort | Payoff | Status |
 |---|---|---|---|---|
-| 1 | `supersedes` as a relation type | ~10 lines | Large | Phase A.6 |
-| 2 | Provenance rows + answer rating | ~1 day | Large — unblocks the benchmark | Phase B.13 |
-| 3 | Subchunk → parent resolution | ~1 join | Prevents a silent bug | Before Phase D |
-| 4 | Contradiction clusters | ~half a day | Medium | Phase D.22 |
-| 5 | "Why this result" line | ~1 hour | Medium — and it debugs Phase D | Phase D.21 |
+| 1 | `supersedes` as a relation type | ~10 lines | Large | ✅ `RelationType::Supersedes`, weighted just under `contradicts` |
+| 2 | Provenance rows + answer rating | ~1 day | Large — unblocks the benchmark | ✅ `brain-engine::store`, `Ctrl+G`/`Ctrl+B`, counts in `brainctl status` |
+| 3 | Subchunk → parent resolution | ~1 join | Prevents a silent bug | ✅ already handled by the structural `parent` edge — once `min_weight` stopped cutting it off (below) |
+| 4 | Contradiction clusters | ~half a day | Medium | ✅ `Database::unresolved_contradictions`, reported by `brainctl doctor` |
+| 5 | "Why this result" line | ~1 hour | Medium — and it debugs Phase D | ✅ `Explain::describe`, under every source in the dock and `brainctl ask` |
+
+**All five landed.** The headline finding — graph traversal before embeddings — landed with
+them: retrieval is seed → expand → rank with graph expansion on by default, and no embedding
+subsystem exists. Nothing from §1.4's "do not take" list was taken.
+
+**Transfer 3 turned out to be already solved, and the real bug was next door.** The concern
+is real and arrives before subchunking does: links get written where a topic is introduced,
+so a note whose `# Root` holds every `[[link]]` and whose `## Details` matches the query
+retrieves the subsection, which declares no edges of its own.
+
+But `yalive::graph` already emits a structural `parent` edge and expansion already walks
+edges in both directions, so the parent's links were reachable the whole time — at two hops,
+scoring `1.0 × 0.6 × 0.6(related) × 0.6 × 0.3(parent) = 0.065`. The `min_weight` default of
+0.1 was cutting that off. **A first attempt added a `parent_seed_weight` knob to fix this;
+the Stage 7 sweep then showed it changed nothing, and it was removed.** What actually fixed
+it was lowering `min_weight` to 0.05: Recall@3 0.83 → 1.00 on the fixture set.
+
+Worth recording as a method note, not just a result: the knob looked obviously right and was
+measurably useless. That is the argument for building the harness before tuning anything.
 
 ### 1 — Make `supersedes` a relation type
 

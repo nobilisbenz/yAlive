@@ -36,6 +36,26 @@ pub struct ParsedSection {
     pub body: String,
     pub relations: Vec<Relation>,
     pub cards: Vec<CardDefinition>,
+    pub actions: Vec<ParsedAction>,
+}
+
+/// An `@action` line: a jump the author declared on a section.
+///
+/// Parsed here, in trusted code, from what the author wrote. **A language model never
+/// contributes one** (spec §3.3, §48) — it may mention an action in prose, but the buttons
+/// come from these rows. That separation is the whole security model for actions, and it is
+/// why this type carries a target rather than a command: there is no representable way to
+/// say "run this".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ParsedAction {
+    /// `file` | `video` | `app` | `project` | `url`.
+    pub kind: String,
+    /// Path, URL, or desktop id — already `~`-expanded and made absolute for paths.
+    pub target: String,
+    /// From `@file PATH:LINE`.
+    pub line: Option<u32>,
+    /// From `@video URL HH:MM:SS`, or lifted out of a URL that already carried `t=`.
+    pub timestamp_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +250,27 @@ pub struct SectionRow {
     pub start_line: usize,
     /// The owning note's front-matter `status:`, for ranking (spec §47).
     pub status: Option<String>,
+}
+
+/// Two sections that disagree, with nothing marking which one won.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContradictionPair {
+    pub left_uid: String,
+    pub left_heading: String,
+    pub left_path: PathBuf,
+    pub right_uid: String,
+    pub right_heading: String,
+    pub right_path: PathBuf,
+}
+
+/// An `@action` row as retrieval reads it back.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionRow {
+    pub section_uid: String,
+    pub kind: String,
+    pub target: String,
+    pub line: Option<u32>,
+    pub timestamp_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]

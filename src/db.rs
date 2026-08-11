@@ -9,7 +9,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 use crate::config::ReviewOrder;
 use crate::model::{
-    ArchivedItem, CardContent, CardRow, DeckRow, Diagnostic, GraphData, GraphLink, GraphNote,
+    ActionRow, ArchivedItem, ContradictionPair, CardContent, CardRow, DeckRow, Diagnostic, GraphData, GraphLink, GraphNote,
     GraphSection, MobileCard, MobileDeck, MobileSnapshot, NoteRow, ParsedNote, RelationRow,
     ReviewCard, ReviewEvent, ReviewScope, ReviewSectionRow, SectionRow, Statistics,
 };
@@ -125,6 +125,19 @@ impl Database {
                 deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
                 PRIMARY KEY(card_id, deck_id)
              );
+             -- `@action` lines, parsed in trusted code from what the author wrote.
+             -- A language model never writes a row here (spec §3.3, §48): it may mention
+             -- an action in prose, but the buttons come from this table. Note there is no
+             -- column that could hold a command — only a typed target.
+             CREATE TABLE IF NOT EXISTS actions (
+                id INTEGER PRIMARY KEY,
+                section_id INTEGER NOT NULL REFERENCES sections(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                target TEXT NOT NULL,
+                line INTEGER,
+                timestamp_seconds INTEGER,
+                position INTEGER NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS diagnostics (
                 path TEXT NOT NULL,
                 line INTEGER NOT NULL,
@@ -142,7 +155,8 @@ impl Database {
              CREATE INDEX IF NOT EXISTS relations_target ON relations(target_section_uid);
              CREATE INDEX IF NOT EXISTS sections_file    ON sections(file_id);
              CREATE INDEX IF NOT EXISTS sections_parent  ON sections(parent_uid);
-             CREATE INDEX IF NOT EXISTS cards_section    ON cards(section_uid);",
+             CREATE INDEX IF NOT EXISTS cards_section    ON cards(section_uid);
+             CREATE INDEX IF NOT EXISTS actions_section  ON actions(section_id);",
         )?;
         add_column(&connection, "files", "topic", "TEXT")?;
         add_column(&connection, "files", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
@@ -322,6 +336,21 @@ impl Database {
                 "DELETE FROM relations WHERE source_section_id = ?1",
                 [section_id],
             )?;
+            transaction.execute("DELETE FROM actions WHERE section_id = ?1", [section_id])?;
+            for (position, action) in section.actions.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO actions(section_id, kind, target, line, timestamp_seconds, position)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        section_id,
+                        action.kind,
+                        action.target,
+                        action.line,
+                        action.timestamp_seconds,
+                        position as i64
+                    ],
+                )?;
+            }
             for relation in &section.relations {
                 transaction.execute(
                     "INSERT OR REPLACE INTO relations(source_section_id, target_section_uid, relation_type, context)
@@ -424,6 +453,103 @@ impl Database {
                AND s.archived_at IS NULL AND f.archived_at IS NULL"
         );
         self.query_sections(&sql, rusqlite::params_from_iter(uids))
+    }
+
+    /// Pairs joined by `contradicts::` where **neither side has been resolved**.
+    ///
+    /// A `contradicts::` edge is a judgement: two sections of your own vault disagree. That
+    /// is fine once one of them is marked `obsolete`, `archived`, or superseded by the
+    /// other — the disagreement has an answer, and ranking already demotes the loser.
+    ///
+    /// What this finds is the case with *no* answer: both sides current, both retrievable,
+    /// and nothing to choose between them. That is precisely what makes an assistant answer
+    /// confidently and wrongly, because whichever one BM25 happens to prefer becomes the
+    /// truth. Reported as vault health rather than fixed automatically — only the author
+    /// knows which one is right.
+    ///
+    /// Second use: an unresolved contradiction is an excellent flashcard.
+    pub fn unresolved_contradictions(&self) -> Result<Vec<ContradictionPair>> {
+        let mut statement = self.connection.prepare(
+            "SELECT src.section_uid, src.heading, srcf.path, tgt.section_uid, tgt.heading, tgtf.path
+             FROM relations r
+             JOIN sections src  ON src.id = r.source_section_id
+             JOIN files    srcf ON srcf.id = src.file_id
+             JOIN sections tgt  ON tgt.section_uid = r.target_section_uid
+             JOIN files    tgtf ON tgtf.id = tgt.file_id
+             WHERE r.relation_type = 'contradicts'
+               AND src.archived_at IS NULL AND tgt.archived_at IS NULL
+               AND srcf.archived_at IS NULL AND tgtf.archived_at IS NULL
+               AND COALESCE(srcf.status, 'current') NOT IN ('obsolete', 'archived')
+               AND COALESCE(tgtf.status, 'current') NOT IN ('obsolete', 'archived')
+               -- A `supersedes` edge either way *is* the resolution.
+               AND NOT EXISTS (
+                   SELECT 1 FROM relations s
+                   WHERE s.relation_type = 'supersedes'
+                     AND ((s.source_section_id = src.id
+                           AND s.target_section_uid = tgt.section_uid)
+                       OR (s.source_section_id = tgt.id
+                           AND s.target_section_uid = src.section_uid))
+               )",
+        )?;
+
+        let rows = statement
+            .query_map([], |row| {
+                Ok(ContradictionPair {
+                    left_uid: row.get(0)?,
+                    left_heading: row.get(1)?,
+                    left_path: PathBuf::from(row.get::<_, String>(2)?),
+                    right_uid: row.get(3)?,
+                    right_heading: row.get(4)?,
+                    right_path: PathBuf::from(row.get::<_, String>(5)?),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // `a contradicts b` and `b contradicts a` are one disagreement, not two.
+        let mut seen = HashSet::new();
+        Ok(rows
+            .into_iter()
+            .filter(|pair| {
+                let key = if pair.left_uid <= pair.right_uid {
+                    (pair.left_uid.clone(), pair.right_uid.clone())
+                } else {
+                    (pair.right_uid.clone(), pair.left_uid.clone())
+                };
+                seen.insert(key)
+            })
+            .collect())
+    }
+
+    /// The `@action` rows declared on the given sections.
+    ///
+    /// Returned with their `section_uid` so the caller can order them by the rank of the
+    /// section that declared them — the top source's actions are the ones `Alt+1` should
+    /// reach.
+    pub fn actions_for(&self, section_uids: &[String]) -> Result<Vec<ActionRow>> {
+        if section_uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", section_uids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT s.section_uid, a.kind, a.target, a.line, a.timestamp_seconds
+             FROM actions a JOIN sections s ON s.id = a.section_id
+             WHERE s.section_uid IN ({placeholders}) AND s.archived_at IS NULL
+             ORDER BY a.section_id, a.position"
+        );
+        let mut statement = self.connection.prepare(&sql)?;
+        Ok(statement
+            .query_map(rusqlite::params_from_iter(section_uids), |row| {
+                Ok(ActionRow {
+                    section_uid: row.get(0)?,
+                    kind: row.get(1)?,
+                    target: row.get(2)?,
+                    line: row.get(3)?,
+                    timestamp_seconds: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?)
     }
 
     /// How much is indexed, for `brainctl status` and the daemon's status report.
@@ -2028,6 +2154,69 @@ prompt: One {{c1::writer}}.
         let new = hits.iter().find(|h| h.uid == "new#root").unwrap();
         assert_eq!(old.status.as_deref(), Some("obsolete"));
         assert_eq!(new.status, None, "an unmarked note has no status, not a default");
+    }
+
+    /// Only genuinely unresolved disagreements are reported.
+    ///
+    /// A `contradicts::` edge is normal and healthy once one side is marked obsolete or
+    /// superseded — that is the author having decided. Reporting those as problems would
+    /// make the check noise, and a noisy check gets ignored.
+    #[test]
+    fn contradictions_are_reported_only_while_nothing_marks_the_winner() {
+        let dir = tempdir().unwrap();
+        let write = |name: &str, body: &str| fs::write(dir.path().join(name), body).unwrap();
+
+        // Unresolved: both current.
+        write(
+            "a.md",
+            "---\nid: a\ntitle: A\n---\n# A {#root}\ncontradicts:: [[b#root]]\nUse rsync.\n",
+        );
+        write("b.md", "---\nid: b\ntitle: B\n---\n# B {#root}\nUse restic.\n");
+
+        // Resolved by status: the old one says so itself.
+        write(
+            "c.md",
+            "---\nid: c\ntitle: C\nstatus: obsolete\n---\n# C {#root}\ncontradicts:: [[d#root]]\nOld.\n",
+        );
+        write("d.md", "---\nid: d\ntitle: D\n---\n# D {#root}\nNew.\n");
+
+        // Resolved by a `supersedes` edge.
+        write(
+            "e.md",
+            "---\nid: e\ntitle: E\n---\n# E {#root}\ncontradicts:: [[f#root]]\nsupersedes:: [[f#root]]\nReplacement.\n",
+        );
+        write("f.md", "---\nid: f\ntitle: F\n---\n# F {#root}\nReplaced.\n");
+
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        let unresolved = db.unresolved_contradictions().unwrap();
+        let uids: Vec<String> = unresolved
+            .iter()
+            .map(|pair| format!("{}|{}", pair.left_uid, pair.right_uid))
+            .collect();
+
+        assert_eq!(unresolved.len(), 1, "reported: {uids:?}");
+        assert!(uids[0].contains("a#root") && uids[0].contains("b#root"));
+    }
+
+    #[test]
+    fn a_mutual_contradiction_is_one_disagreement_not_two() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.md"),
+            "---\nid: a\ntitle: A\n---\n# A {#root}\ncontradicts:: [[b#root]]\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b.md"),
+            "---\nid: b\ntitle: B\n---\n# B {#root}\ncontradicts:: [[a#root]]\n",
+        )
+        .unwrap();
+
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+        assert_eq!(db.unresolved_contradictions().unwrap().len(), 1);
     }
 
     /// `tokenchars '_-.'` is one tokenizer option with a large effect on a vault holding

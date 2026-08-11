@@ -9,8 +9,8 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::model::{
-    CardContent, CardDefinition, Diagnostic, ParsedNote, ParsedSection, QuizDefinition, Relation,
-    validate_quiz,
+    CardContent, CardDefinition, Diagnostic, ParsedAction, ParsedNote, ParsedSection,
+    QuizDefinition, Relation, validate_quiz,
 };
 
 #[derive(Default, Deserialize)]
@@ -104,6 +104,11 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
     let relation_re = Regex::new(
         r"(?m)(?:(outgoing|contradicts|example-of|ingoing|supersedes)::\s*)?\[\[([^\]|]+)(?:\|[^\]]+)?\]\]",
     )?;
+    // `@file`, `@video`, `@app`, `@project`, `@url` on a line of their own. Anchored to
+    // line start so a `@file` mentioned mid-sentence in prose is not mistaken for one.
+    let action_re = Regex::new(r"(?m)^\s*@(file|video|app|project|url)\s+(.+?)\s*$")?;
+    let note_dir = path.parent().unwrap_or(vault).to_path_buf();
+
     let mut sections = Vec::new();
     // level, uid, heading — the heading is carried so `heading_path` falls out of the
     // stack we already maintain for `parent_uid`.
@@ -130,6 +135,7 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
             .join(HEADING_PATH_SEPARATOR);
         stack.push((heading.level, uid.clone(), heading.heading.clone()));
         let body = source[heading.start..end].to_string();
+        let actions = parse_actions(&body, &note_dir, &action_re);
         let relations = relation_re
             .captures_iter(&body)
             .map(|capture| Relation {
@@ -179,6 +185,8 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
             body,
             relations,
             cards,
+            // Attached to the innermost open section, which is what `body` already is.
+            actions,
         });
     }
 
@@ -196,6 +204,186 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
         sections,
         diagnostics,
     })
+}
+
+/// Parse the `@action` lines in a section body.
+///
+/// `note_dir` is the directory containing the note, so a relative `@file ./diagram.png`
+/// resolves the way the author meant it — relative to what they were looking at, not to
+/// wherever the daemon happens to be running.
+fn parse_actions(body: &str, note_dir: &Path, pattern: &Regex) -> Vec<ParsedAction> {
+    pattern
+        .captures_iter(body)
+        .filter_map(|capture| {
+            let kind = capture.get(1)?.as_str();
+            let rest = capture.get(2)?.as_str().trim();
+            if rest.is_empty() {
+                return None;
+            }
+
+            Some(match kind {
+                "file" => {
+                    let (path, line) = split_path_and_line(rest);
+                    ParsedAction {
+                        kind: "file".into(),
+                        target: absolute(path, note_dir),
+                        line,
+                        timestamp_seconds: None,
+                    }
+                }
+                "project" => ParsedAction {
+                    kind: "project".into(),
+                    target: absolute(rest, note_dir),
+                    line: None,
+                    timestamp_seconds: None,
+                },
+                "video" => {
+                    // `@video URL HH:MM:SS`, with the timestamp optional and the URL itself
+                    // possibly already carrying one.
+                    let (url, trailing) = match rest.split_once(char::is_whitespace) {
+                        Some((url, rest)) => (url, rest.trim()),
+                        None => (rest, ""),
+                    };
+                    let (clean, embedded) = strip_url_timestamp(url);
+                    let seconds = parse_timestamp(trailing).or(embedded);
+                    ParsedAction {
+                        kind: "video".into(),
+                        // Stored clean and rebuilt at launch time by trusted code (spec
+                        // §31), rather than round-tripping a URL a note author hand-edited.
+                        target: clean,
+                        line: None,
+                        timestamp_seconds: seconds,
+                    }
+                }
+                "app" => ParsedAction {
+                    kind: "app".into(),
+                    target: rest.to_string(),
+                    line: None,
+                    timestamp_seconds: None,
+                },
+                _ => ParsedAction {
+                    kind: "url".into(),
+                    target: rest.to_string(),
+                    line: None,
+                    timestamp_seconds: None,
+                },
+            })
+        })
+        .collect()
+}
+
+/// Split `PATH:LINE`, on the **last** colon.
+///
+/// Splitting on the first would break `/home/nabi/notes/c:/thing.md` and every Windows-ish
+/// or colon-containing path. A trailing segment only counts as a line number if it is
+/// entirely digits — `foo.md:bar` is a path.
+fn split_path_and_line(text: &str) -> (&str, Option<u32>) {
+    match text.rsplit_once(':') {
+        Some((path, tail)) if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) => {
+            (path, tail.parse().ok())
+        }
+        _ => (text, None),
+    }
+}
+
+/// Expand `~` and resolve a relative path against the note's directory.
+fn absolute(path: &str, note_dir: &Path) -> String {
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => PathBuf::from(home).join(rest),
+            None => PathBuf::from(path),
+        },
+        None => PathBuf::from(path),
+    };
+
+    if expanded.is_absolute() {
+        expanded.to_string_lossy().to_string()
+    } else {
+        note_dir.join(expanded).to_string_lossy().to_string()
+    }
+}
+
+/// `HH:MM:SS`, `MM:SS`, `1h2m3s`, or bare seconds.
+fn parse_timestamp(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    if text.contains(':') {
+        let mut seconds = 0u64;
+        for part in text.split(':') {
+            seconds = seconds.checked_mul(60)?.checked_add(part.parse().ok()?)?;
+        }
+        return Some(seconds);
+    }
+
+    if let Ok(bare) = text.parse::<u64>() {
+        return Some(bare);
+    }
+
+    // `1h30m15s`, the form YouTube itself uses.
+    let mut total = 0u64;
+    let mut current = 0u64;
+    let mut saw_unit = false;
+    for character in text.chars() {
+        match character {
+            '0'..='9' => current = current.checked_mul(10)?.checked_add(character as u64 - '0' as u64)?,
+            'h' => {
+                total += current * 3600;
+                current = 0;
+                saw_unit = true;
+            }
+            'm' => {
+                total += current * 60;
+                current = 0;
+                saw_unit = true;
+            }
+            's' => {
+                total += current;
+                current = 0;
+                saw_unit = true;
+            }
+            _ => return None,
+        }
+    }
+    saw_unit.then_some(total + current)
+}
+
+/// Lift a `t=` timestamp out of a URL, returning the URL without it.
+///
+/// A note author who copied a link from YouTube's "share at current time" gets the
+/// timestamp honoured without having to restate it.
+fn strip_url_timestamp(url: &str) -> (String, Option<u64>) {
+    let Some((base, query)) = url.split_once('?') else {
+        return (url.to_string(), None);
+    };
+
+    let mut seconds = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|parameter| {
+            match parameter.split_once('=') {
+                // `t` is the canonical one; `start` is what embeds use.
+                Some(("t" | "start", value)) => {
+                    seconds = parse_timestamp(value.trim_end_matches('s'));
+                    // Only drop it if we understood it; an unparseable `t` is left alone
+                    // rather than silently deleted from the link.
+                    seconds.is_none()
+                }
+                _ => true,
+            }
+        })
+        .collect();
+
+    if seconds.is_none() {
+        return (url.to_string(), None);
+    }
+    if kept.is_empty() {
+        (base.to_string(), seconds)
+    } else {
+        (format!("{base}?{}", kept.join("&")), seconds)
+    }
 }
 
 fn parse_front_matter(source: &str) -> Result<(FrontMatter, usize)> {
@@ -439,6 +627,126 @@ mod tests {
 
     use super::*;
     use crate::model::card_capabilities;
+
+    fn actions_in(body: &str) -> Vec<ParsedAction> {
+        let pattern = Regex::new(r"(?m)^\s*@(file|video|app|project|url)\s+(.+?)\s*$").unwrap();
+        parse_actions(body, Path::new("/home/nabi/brain"), &pattern)
+    }
+
+    #[test]
+    fn a_file_action_takes_a_line_number_from_the_last_colon() {
+        // Splitting on the *first* colon breaks any path containing one, and a trailing
+        // segment that is not all digits is part of the path rather than a line.
+        assert_eq!(split_path_and_line("/tmp/a.rs:42"), ("/tmp/a.rs", Some(42)));
+        assert_eq!(
+            split_path_and_line("/tmp/odd:name/a.rs:42"),
+            ("/tmp/odd:name/a.rs", Some(42))
+        );
+        assert_eq!(split_path_and_line("/tmp/a.rs:bar"), ("/tmp/a.rs:bar", None));
+        assert_eq!(split_path_and_line("/tmp/a.rs"), ("/tmp/a.rs", None));
+    }
+
+    #[test]
+    fn a_relative_file_action_resolves_against_the_note_not_the_daemon() {
+        // The author wrote the path relative to what they were looking at. Resolving it
+        // against the process's cwd would work in testing and break at login.
+        let actions = actions_in("@file ./diagrams/pipeline.svg\n");
+        assert_eq!(actions[0].target, "/home/nabi/brain/./diagrams/pipeline.svg");
+    }
+
+    #[test]
+    fn a_tilde_in_an_action_is_expanded() {
+        let actions = actions_in("@file ~/projects/obs/src/smoothing.rs:41\n");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            actions[0].target,
+            format!("{home}/projects/obs/src/smoothing.rs")
+        );
+        assert_eq!(actions[0].line, Some(41));
+    }
+
+    #[test]
+    fn a_video_timestamp_is_accepted_in_every_form_a_note_might_use() {
+        assert_eq!(parse_timestamp("1:23"), Some(83));
+        assert_eq!(parse_timestamp("01:02:03"), Some(3723));
+        assert_eq!(parse_timestamp("414"), Some(414));
+        assert_eq!(parse_timestamp("6m54s"), Some(414));
+        assert_eq!(parse_timestamp("1h30m"), Some(5400));
+        assert_eq!(parse_timestamp("nonsense"), None);
+        assert_eq!(parse_timestamp(""), None);
+    }
+
+    #[test]
+    fn a_timestamp_already_in_the_url_is_lifted_out_and_the_url_stored_clean() {
+        // Spec §31: store the canonical URL and rebuild the timestamped one at launch in
+        // trusted code, rather than round-tripping whatever a note author pasted.
+        let actions = actions_in("@video https://youtu.be/ABC?t=414\n");
+        assert_eq!(actions[0].target, "https://youtu.be/ABC");
+        assert_eq!(actions[0].timestamp_seconds, Some(414));
+
+        // Other query parameters survive.
+        let actions = actions_in("@video https://www.youtube.com/watch?v=ABC&t=6m54s\n");
+        assert_eq!(actions[0].target, "https://www.youtube.com/watch?v=ABC");
+        assert_eq!(actions[0].timestamp_seconds, Some(414));
+    }
+
+    #[test]
+    fn an_explicit_timestamp_beats_one_embedded_in_the_url() {
+        let actions = actions_in("@video https://youtu.be/ABC?t=10 1:00\n");
+        assert_eq!(actions[0].timestamp_seconds, Some(60));
+    }
+
+    #[test]
+    fn an_unparseable_timestamp_is_left_in_the_url_rather_than_deleted() {
+        // Silently dropping a query parameter we did not understand would break the link.
+        let actions = actions_in("@video https://example.com/v?t=chapter-three\n");
+        assert_eq!(actions[0].target, "https://example.com/v?t=chapter-three");
+        assert_eq!(actions[0].timestamp_seconds, None);
+    }
+
+    #[test]
+    fn an_action_mentioned_mid_sentence_is_prose_not_an_action() {
+        // Notes talk *about* things. `@file` has to be a line of its own to count.
+        let actions = actions_in("I use the @file syntax to link things.\nSee @app blender too.\n");
+        assert!(actions.is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn every_action_kind_parses() {
+        let actions = actions_in(
+            "@file /tmp/a.rs:12\n\
+             @video https://youtu.be/ABC 2:00\n\
+             @app com.obsproject.Studio\n\
+             @project ~/projects/obs\n\
+             @url https://example.com/docs\n",
+        );
+        let kinds: Vec<&str> = actions.iter().map(|a| a.kind.as_str()).collect();
+        assert_eq!(kinds, ["file", "video", "app", "project", "url"]);
+        assert_eq!(actions[1].timestamp_seconds, Some(120));
+        assert_eq!(actions[2].target, "com.obsproject.Studio");
+    }
+
+    #[test]
+    fn actions_attach_to_the_section_that_declared_them() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("obs.md");
+        fs::write(
+            &path,
+            "---\nid: obs\ntitle: OBS\n---\n\
+             # OBS {#root}\n@app com.obsproject.Studio\n\
+             ## Smoothing {#smooth}\n@video https://youtu.be/ABC 6:54\n",
+        )
+        .unwrap();
+
+        let note = parse_note(&path, dir.path()).unwrap();
+        let root = note.sections.iter().find(|s| s.uid == "obs#root").unwrap();
+        let smooth = note.sections.iter().find(|s| s.uid == "obs#smooth").unwrap();
+
+        assert_eq!(root.actions.len(), 1);
+        assert_eq!(root.actions[0].kind, "app");
+        assert_eq!(smooth.actions.len(), 1);
+        assert_eq!(smooth.actions[0].timestamp_seconds, Some(414));
+    }
 
     #[test]
     fn parses_sections_relations_and_all_card_types() {
