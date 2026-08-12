@@ -7,3 +7,6 @@
 [submodule "yy"]
 	path = yy
 	url = git@github.com:nobilisbenz/yy.git
+[submodule "yClippy"]
+	path = yClippy
+	url = git@github.com:nobilisbenz/yClippy.git
