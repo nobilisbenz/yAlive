@@ -1,7 +1,0 @@
-editor = "nvim"
-desired_retention = 0.9
-new_cards_per_day = 20
-max_reviews_per_day = 200
-review_order = "due"
-bury_siblings = true
-reindex_interval_ms = 1000
