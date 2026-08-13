@@ -58,6 +58,11 @@ enum EditorCommand {
     },
     /// List incoming and outgoing relations for a section.
     Relations { section_uid: String },
+    /// List `@video` actions, so editors never parse Markdown themselves.
+    Videos {
+        /// Restrict to one section; omit for every video in the vault.
+        section_uid: Option<String>,
+    },
     /// Return diagnostics as JSON.
     Diagnostics,
 }
@@ -120,6 +125,37 @@ fn main() -> Result<()> {
     }
 }
 
+/// Every `@video` action, joined to the section that declared it, so a picker
+/// has the label and the jump-back location without touching Markdown.
+fn video_items(db: &Database, section_uid: Option<&str>) -> Result<Vec<serde_json::Value>> {
+    let sections = match section_uid {
+        Some(uid) => db.sections_by_uids(&[uid.to_string()])?,
+        None => db.sections()?,
+    };
+
+    let uids: Vec<String> = sections.iter().map(|s| s.uid.clone()).collect();
+    let by_uid: std::collections::HashMap<&str, &yalive::model::SectionRow> =
+        sections.iter().map(|s| (s.uid.as_str(), s)).collect();
+
+    Ok(db
+        .actions_for(&uids)?
+        .into_iter()
+        .filter(|action| action.kind == "video")
+        .map(|action| {
+            let section = by_uid.get(action.section_uid.as_str());
+            json!({
+                "url": action.target,
+                "seconds": action.timestamp_seconds,
+                "label": section.map(|s| s.heading_path.clone()).unwrap_or_default(),
+                "note_title": section.map(|s| s.note_title.clone()).unwrap_or_default(),
+                "section_uid": action.section_uid,
+                "path": section.map(|s| s.path.display().to_string()),
+                "line": action.line.map(u32::from).or(section.map(|s| s.start_line as u32)),
+            })
+        })
+        .collect())
+}
+
 fn run_editor_command(vault: &Path, command: EditorCommand) -> Result<()> {
     if let EditorCommand::Capabilities = &command {
         println!(
@@ -144,6 +180,10 @@ fn run_editor_command(vault: &Path, command: EditorCommand) -> Result<()> {
         EditorCommand::Relations { section_uid } => json!({
             "protocol_version": 1,
             "items": db.relations(&section_uid)?,
+        }),
+        EditorCommand::Videos { section_uid } => json!({
+            "protocol_version": 1,
+            "items": video_items(&db, section_uid.as_deref())?,
         }),
         EditorCommand::Diagnostics => json!({
             "protocol_version": 1,

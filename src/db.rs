@@ -2515,6 +2515,58 @@ prompt: One {{c1::writer}}.
     }
 
     #[test]
+    fn clips_survive_the_round_trip_into_the_mobile_snapshot() {
+        // The seam that matters: a clip written in a note has to reach the
+        // phone through the index and the snapshot without being flattened.
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("rust.md"),
+            "---\nid: rust\ntitle: Rust\n---\n# Rust {#root}\n\n\
+             @video https://youtu.be/dQw4w9WgXcQ 06:54  Chapter on borrowing\n\n\
+             ```quiz\nid: q1\ntype: cloze\nprompt: A {{c1::mutable}} borrow is exclusive.\n```\n\n\
+             ## Elision {#elide}\n\n\
+             ```quiz\nid: q2\ntype: cloze\nprompt: Elision {{c1::infers}} lifetimes.\n\
+             clip: https://youtu.be/ABCdefGHIjk 12:03-12:40  Elision rules\n```\n",
+        )
+        .unwrap();
+        let mut db = Database::open(dir.path()).unwrap();
+        db.index_vault(dir.path()).unwrap();
+
+        let snapshot = db
+            .mobile_snapshot(20, 200, ReviewOrder::Due, false)
+            .unwrap();
+
+        let clips_for = |uid: &str| -> crate::model::CardClips {
+            let card = snapshot
+                .cards
+                .iter()
+                .find(|card| card.card.uid.contains(uid))
+                .unwrap_or_else(|| panic!("no card for {uid} in the snapshot"));
+            match &card.card.content {
+                CardContent::Cloze { clips, .. } => clips.clone(),
+                other => panic!("expected a cloze card, got {other:?}"),
+            }
+        };
+
+        // Inherited from the section's `@video`.
+        let inherited = clips_for("q1").answer.expect("q1 should carry a clip");
+        assert_eq!(inherited.video_id.as_deref(), Some("dQw4w9WgXcQ"));
+        assert_eq!(inherited.start, 414);
+
+        // Explicit, with a range and a label.
+        let explicit = clips_for("q2").answer.expect("q2 should carry a clip");
+        assert_eq!(explicit.video_id.as_deref(), Some("ABCdefGHIjk"));
+        assert_eq!(explicit.start, 723);
+        assert_eq!(explicit.end, Some(760));
+        assert_eq!(explicit.label.as_deref(), Some("Elision rules"));
+
+        // And it has to survive the JSON the phone actually downloads.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("\"ABCdefGHIjk\""), "clip missing from snapshot JSON");
+        assert!(json.contains("Elision rules"));
+    }
+
+    #[test]
     fn archives_notes_sections_and_quizzes_across_reindexing() {
         let dir = tempdir().unwrap();
         fs::write(

@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     pub editor: Option<String>,
+    /// Argv template for an `@video` action, sharing yy's placeholder shape so
+    /// there is one mental model across the ecosystem:
+    /// `player = ["yclippy", "play", "{url}", "--at", "{seconds}"]`.
+    ///
+    /// A template without `{seconds}` gets the timestamp rebuilt into `{url}`,
+    /// so `["xdg-open", "{url}"]` still lands at the right moment.
+    pub player: Option<Vec<String>>,
     pub desired_retention: f32,
     pub new_cards_per_day: usize,
     pub max_reviews_per_day: usize,
@@ -27,6 +34,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             editor: None,
+            player: None,
             desired_retention: 0.9,
             new_cards_per_day: 20,
             max_reviews_per_day: 200,

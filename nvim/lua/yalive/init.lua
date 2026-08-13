@@ -2,6 +2,11 @@ local M = {}
 
 local config = {
   executable = "yalive",
+  -- The video surface. `player` is the argv template used to launch a moment;
+  -- it shares its placeholder shape with yalive's `.notes/config.toml` and yy's
+  -- `[openers]`, so one mental model covers all three.
+  clipper = "yclippy",
+  player = { "yclippy", "play", "{url}", "--at", "{seconds}" },
   vault = nil,
   auto_index = true,
   diagnostics = true,
@@ -193,6 +198,205 @@ local function insert_line(text)
   vim.api.nvim_put({ text }, "l", true, true)
 end
 
+-- ── video ──────────────────────────────────────────────────────────────────
+
+local function format_hms(seconds)
+  seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+  local h = math.floor(seconds / 3600)
+  local m = math.floor((seconds % 3600) / 60)
+  local s = seconds % 60
+  if h > 0 then
+    return string.format("%d:%02d:%02d", h, m, s)
+  end
+  return string.format("%d:%02d", m, s)
+end
+
+-- Expands `{url}` and `{seconds}` per element, never re-splitting on
+-- whitespace. A template without `{seconds}` gets the timestamp rebuilt into
+-- the URL, so `{ "xdg-open", "{url}" }` still lands at the right moment.
+local function expand_player(url, seconds)
+  local template = config.player
+  if type(template) == "string" then
+    template = { template, "{url}" }
+  end
+
+  local wants_seconds = false
+  for _, part in ipairs(template) do
+    if part:find("{seconds}", 1, true) then
+      wants_seconds = true
+      break
+    end
+  end
+
+  local effective = url
+  if seconds and seconds > 0 and not wants_seconds then
+    effective = url .. (url:find("?", 1, true) and "&" or "?") .. "t=" .. math.floor(seconds) .. "s"
+  end
+
+  local argv = {}
+  for _, part in ipairs(template) do
+    local out = part:gsub("{url}", (effective:gsub("%%", "%%%%")))
+    out = out:gsub("{seconds}", tostring(math.floor(seconds or 0)))
+    table.insert(argv, out)
+  end
+  return argv
+end
+
+local function launch_video(url, seconds)
+  local argv = expand_player(url, seconds)
+  if vim.fn.executable(argv[1]) ~= 1 then
+    notify("Player not found: " .. argv[1], vim.log.levels.ERROR)
+    return
+  end
+  local ok, err = pcall(vim.system, argv, { detach = true })
+  if not ok then
+    notify("Failed to launch player: " .. tostring(err), vim.log.levels.ERROR)
+    return
+  end
+  notify(("Playing %s%s"):format(url, seconds and seconds > 0 and (" at " .. format_hms(seconds)) or ""))
+end
+
+local function videos(vault, section_uid)
+  local args = { "videos" }
+  if section_uid then
+    table.insert(args, section_uid)
+  end
+  local response = editor(vault, args)
+  return response and response.items or nil
+end
+
+local function video_label(item)
+  local stamp = item.seconds and item.seconds > 0 and format_hms(item.seconds) or "--:--"
+  local where = item.label ~= "" and item.label or item.note_title
+  return string.format("%-9s %s  [%s]", stamp, where, item.url)
+end
+
+-- `@video URL 06:54  Label` — returns the URL and the parsed second, or nil.
+local function parse_video_line(line)
+  local url, trailing = line:match("^%s*@video%s+(%S+)%s*(.*)$")
+  if not url then
+    return nil
+  end
+  local stamp = trailing:match("^(%S+)")
+  local seconds
+  if stamp then
+    local h, m, s = stamp:match("^(%d+):(%d+):(%d+)$")
+    if h then
+      seconds = tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s)
+    else
+      local mm, ss = stamp:match("^(%d+):(%d+)$")
+      if mm then
+        seconds = tonumber(mm) * 60 + tonumber(ss)
+      else
+        seconds = tonumber(stamp)
+      end
+    end
+  end
+  return { url = url, seconds = seconds }
+end
+
+--- Play the `@video` on this line, else the URL under the cursor, else the
+--- first video in the enclosing section.
+function M.play()
+  local vault = current_vault()
+  if not vault then return end
+
+  local inline = parse_video_line(vim.api.nvim_get_current_line())
+  if inline then
+    launch_video(inline.url, inline.seconds)
+    return
+  end
+
+  local under_cursor = vim.fn.expand("<cWORD>"):match("https?://[^%s)>%]]+")
+  if under_cursor and (under_cursor:find("youtube%.com") or under_cursor:find("youtu%.be")) then
+    launch_video(under_cursor, nil)
+    return
+  end
+
+  local all = sections(vault)
+  if not all then return end
+  local section = current_section(vault, all)
+  if not section then return end
+
+  local items = videos(vault, section.uid)
+  if not items or #items == 0 then
+    notify("No @video in this section")
+    return
+  end
+  launch_video(items[1].url, items[1].seconds)
+end
+
+--- Browse the whole vault's videos and play one.
+function M.videos()
+  local vault = current_vault()
+  if not vault then return end
+  local items = videos(vault)
+  if not items then return end
+  pick(items, "Videos", video_label, function(item)
+    launch_video(item.url, item.seconds)
+  end)
+end
+
+--- Browse the yClippy library and play a video or clip from it.
+function M.library(query)
+  if vim.fn.executable(config.clipper) ~= 1 then
+    notify("Executable not found: " .. config.clipper, vim.log.levels.ERROR)
+    return
+  end
+  local argv = { config.clipper, "list", "--json" }
+  if query and query ~= "" then
+    vim.list_extend(argv, { "--query", query })
+  end
+  local result = vim.system(argv, { text = true }):wait()
+  if result.code ~= 0 then
+    notify(vim.trim(result.stderr ~= "" and result.stderr or result.stdout), vim.log.levels.ERROR)
+    return
+  end
+  local ok, value = pcall(vim.json.decode, result.stdout)
+  if not ok or value.protocol_version ~= 1 then
+    notify("Unsupported or invalid yclippy list response", vim.log.levels.ERROR)
+    return
+  end
+  pick(value.items or {}, "Library", function(item)
+    return string.format("%-6s %-9s %s", item.kind, format_hms(item.start_seconds), item.title)
+  end, function(item)
+    launch_video(item.url, item.start_seconds)
+  end)
+end
+
+--- Pick from the yClippy library and insert an `@video` line at the cursor.
+--- This is what closes the loop: clip in yClippy, drop the line into a note,
+--- and the moment becomes indexed, graphed, and replayable from three places.
+function M.insert(query)
+  if vim.fn.executable(config.clipper) ~= 1 then
+    notify("Executable not found: " .. config.clipper, vim.log.levels.ERROR)
+    return
+  end
+  local argv = { config.clipper, "list", "--json" }
+  if query and query ~= "" then
+    vim.list_extend(argv, { "--query", query })
+  end
+  local result = vim.system(argv, { text = true }):wait()
+  if result.code ~= 0 then
+    notify(vim.trim(result.stderr ~= "" and result.stderr or result.stdout), vim.log.levels.ERROR)
+    return
+  end
+  local ok, value = pcall(vim.json.decode, result.stdout)
+  if not ok or value.protocol_version ~= 1 then
+    notify("Unsupported or invalid yclippy list response", vim.log.levels.ERROR)
+    return
+  end
+  pick(value.items or {}, "Library", function(item)
+    return string.format("%-6s %-9s %s", item.kind, format_hms(item.start_seconds), item.title)
+  end, function(item)
+    -- The URL is stored clean; yalive lifts a `t=` back out at index time, so
+    -- the timestamp is written as its own field rather than glued into the URL.
+    local url = item.url:gsub("[?&]t=[0-9hms]+", "")
+    local stamp = item.start_seconds > 0 and (" " .. format_hms(item.start_seconds)) or ""
+    insert_line(("@video %s%s  %s"):format(url, stamp, item.title))
+  end)
+end
+
 local function choose_relation(capabilities, callback)
   pick(capabilities.relation_types, "Relation type", function(item)
     return item.relation_type
@@ -332,7 +536,19 @@ local function create_commands()
   vim.api.nvim_create_user_command("YaliveRelations", M.relations, {})
   vim.api.nvim_create_user_command("YaliveIndex", function() M.index(false) end, {})
   vim.api.nvim_create_user_command("YaliveDiagnostics", function() M.diagnostics(0) end, {})
+  vim.api.nvim_create_user_command("YClippyPlay", M.play, {})
+  vim.api.nvim_create_user_command("YaliveVideos", M.videos, {})
+  vim.api.nvim_create_user_command("YClippyLibrary", function(opts) M.library(opts.args) end, { nargs = "*" })
+  vim.api.nvim_create_user_command("YClippyInsert", function(opts) M.insert(opts.args) end, { nargs = "*" })
 end
+
+--- Pure helpers, exposed for `nvim/tests/`. Not part of the public API.
+M._internal = {
+  format_hms = format_hms,
+  expand_player = expand_player,
+  parse_video_line = parse_video_line,
+  set_player = function(template) config.player = template end,
+}
 
 function M.setup(options)
   config = vim.tbl_deep_extend("force", config, options or {})

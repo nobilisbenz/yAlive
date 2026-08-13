@@ -103,9 +103,30 @@ yclippy list --json | jq '.items[] | {title, video_id}'
 yclippy add https://youtu.be/dQw4w9WgXcQ --folder "Rust"
 ```
 
-Brain Dock (`yy`) launches it with one config line — see `[openers] video = ["yclippy", "play", "{url}", "--at", "{seconds}"]` in `config/brain.toml`. The Neovim plugin exposes `:YClippyPlay`, `:YClippyLibrary`, and `:YClippyInsert`. The TUI binds `v` on the Dashboard to play the `@video` under the cursor. The phone answers the same intent through a `yclippy://play?v=…&t=…` deep link registered in the manifest.
+`list` is headless — it prints JSON and exits without starting the GUI, so
+pickers can shell out to it. `play` forwards to an already-running instance.
 
-The library lives at `<vault>/.notes/yclippy/library.json` and is sync'd via the GitHub Contents API. Per-device append-only logs at `<vault>/.notes/yclippy/devices/<device>.jsonl` give two phones concurrent edits without Git conflicts; `compact_library` on desktop sync rewrites the canonical state and drops processed logs.
+Brain Dock (`yy`) launches it with one config line — see `[openers] video = ["yclippy", "play", "{url}", "--at", "{seconds}"]` in `config/brain.toml`. The Neovim plugin exposes `:YClippyPlay`, `:YClippyLibrary`, `:YClippyInsert`, and `:YaliveVideos`. The TUI binds `v` on the Dashboard to play the `@video` on the selected section. The phone answers the same intent through a `yclippy://play?v=…&t=…` deep link registered in the manifest.
+
+The library is a local SQLite database. It syncs into the vault repository:
+
+```
+.notes/yclippy/library.json            canonical merged state, written by compaction
+.notes/yclippy/devices/<device>.jsonl  one file per device, one writer, ever
+```
+
+No device ever writes another device's file, so two phones editing offline
+cannot conflict. Sync runs pull → merge → push → compact, in that order. Folders
+and clips are identified by `uid` and videos by their YouTube id; local rowids
+never travel, and parent and folder links are carried as uids. Conflicts resolve
+per record by `(updated_at, last_writer)` — the device id breaks ties so every
+device picks the same winner and the fleet converges. Compaction rewrites
+`library.json` against the SHA it read, so a concurrent compactor retries rather
+than clobbering, and it is desktop-only.
+
+One limitation worth knowing: `updated_at` is a wall clock, so a device with a
+badly wrong clock will win conflicts it should not. Timestamps are never used to
+decide *whether* to apply an op, only which of two versions of one record wins.
 
 Machine-readable editor commands are also available. They are versioned JSON so editor plugins do not need to read the disposable SQLite schema:
 
@@ -113,8 +134,13 @@ Machine-readable editor commands are also available. They are versioned JSON so 
 yalive --vault ~/Notes editor capabilities
 yalive --vault ~/Notes editor sections "borrowing"
 yalive --vault ~/Notes editor relations rust-ownership#borrowing
+yalive --vault ~/Notes editor videos            # every @video in the vault
+yalive --vault ~/Notes editor videos rust#own   # just this section's
 yalive --vault ~/Notes editor diagnostics
 ```
+
+`editor videos` returns `{url, seconds, label, note_title, section_uid, path, line}`
+per `@video` action, so a plugin never has to parse Markdown to build a picker.
 
 ## Keys
 
@@ -137,9 +163,12 @@ yalive --vault ~/Notes editor diagnostics
 | Search | type to search, arrows navigate, `Enter` open, `Esc` cancel |
 | Review | `Space` reveal cloze, `j/k` and `Space` choose answers |
 | Review | type code gaps, `Tab` changes gap, `Enter` checks |
+| Review | `v` play this card's clip |
 | Rating | `1` Again, `2` Hard, `3` Good, `4` Easy |
 
 `e` uses `editor` from `.notes/config.toml`, then `$VISUAL`, `$EDITOR`, and finally `nvim`. The TUI suspends and returns to the same stable section after editing.
+
+`v` on the Dashboard plays the selected section's `@video` in the configured `player`, falling back to the first YouTube URL in the section body.
 
 ## Neovim
 
@@ -166,12 +195,46 @@ ingoing:: [[rust-basics#references]]
 
 Quiz blocks are fenced `quiz` blocks containing YAML. Supported `type` values are `cloze`, `multiple-choice`, and `code-gap`. See [`examples/vault/rust-ownership.md`](examples/vault/rust-ownership.md) for complete examples.
 
+### Clips as answers
+
+Any quiz block can carry a moment in a video, which plays inside the card during
+review — in the TUI with `v`, and on the phone as a tappable tile in yReviewy:
+
+```yaml
+clip: https://youtu.be/dQw4w9WgXcQ 06:54-07:20  The borrow checker bit
+prompt_clip: https://youtu.be/dQw4w9WgXcQ 11:00
+```
+
+`clip:` is the evidence and appears only after the answer is revealed.
+`prompt_clip:` is the stimulus and appears with the question — use it when the
+video *is* the question. The end of a range is optional; so is the label.
+
+A quiz with no `clip:` inherits its section's own `@video` line, so the common
+case needs no extra syntax:
+
+```markdown
+## Borrowing {#borrow}
+
+@video https://youtu.be/dQw4w9WgXcQ 06:54  Chapter on borrowing
+
+```quiz
+id: borrow-1
+type: cloze
+prompt: A {{c1::mutable}} borrow is exclusive for its whole lifetime.
+```
+```
+
+Inheritance only ever fills the answer side; putting a video beside the question
+is always a deliberate choice. yClippy's "clip: line" clipboard preset emits this
+line directly, so marking a range and pasting it into a note is the whole loop.
+
 ## Configuration
 
 Optional `<vault>/.notes/config.toml`:
 
 ```toml
 editor = "nvim"
+player = ["yclippy", "play", "{url}", "--at", "{seconds}"]
 desired_retention = 0.90
 new_cards_per_day = 20
 max_reviews_per_day = 200
@@ -179,6 +242,12 @@ review_order = "due"
 bury_siblings = true
 reindex_interval_ms = 1000
 ```
+
+`player` is the argv template `v` uses on the Dashboard to launch the `@video`
+action of the selected section. It shares its placeholder shape with yy's
+`[openers]`, so one template works in both. A template without `{seconds}` — the
+default, `["xdg-open", "{url}"]` — gets the timestamp rebuilt into the URL, so a
+machine without yClippy installed still lands at the right moment.
 
 Review submissions are not stored. Ratings, correctness, response time, FSRS memory state, and scheduling intervals are retained. Export review history periodically with `export-reviews`; the default output is `.notes/reviews.jsonl`.
 

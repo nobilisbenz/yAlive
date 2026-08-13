@@ -72,12 +72,58 @@ pub struct Diagnostic {
     pub message: String,
 }
 
+/// A moment in a video attached to a card.
+///
+/// Written as `clip: URL 06:54-07:20` in a quiz block, or inherited from the
+/// section's own `@video` line. Carried as a structured field rather than as
+/// markup so the renderer builds the embed itself — a card must never be able
+/// to inject an iframe into the reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ClipRef {
+    /// The canonical watch URL, with any `t=` stripped out into `start`.
+    pub url: String,
+    /// The YouTube id, when the URL is a YouTube one. Lets a renderer build an
+    /// embed without re-parsing.
+    pub video_id: Option<String>,
+    pub start: u64,
+    /// Absent means "play to the end".
+    pub end: Option<u64>,
+    pub label: Option<String>,
+}
+
+/// Where a clip sits on a card, which decides what the card actually tests.
+///
+/// A clip shown beside the question is the stimulus — "you just watched this,
+/// what happens next?". A clip shown on reveal is the evidence — "here is where
+/// it was explained". Keeping them apart protects the recall: a clip rendered
+/// with the prompt when it belongs to the answer lets you read the answer off
+/// the video before rating yourself, and the interval that follows is a lie.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CardClips {
+    /// Shown with the question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<ClipRef>,
+    /// Shown only after the answer is revealed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<ClipRef>,
+}
+
+impl CardClips {
+    pub fn is_empty(&self) -> bool {
+        self.prompt.is_none() && self.answer.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum QuizDefinition {
     Cloze {
         id: String,
         prompt: String,
+        #[serde(default)]
+        clip: Option<String>,
+        #[serde(default)]
+        prompt_clip: Option<String>,
     },
     MultipleChoice {
         id: String,
@@ -86,6 +132,10 @@ pub enum QuizDefinition {
         question: String,
         answers: Vec<ChoiceAnswer>,
         explanation: Option<String>,
+        #[serde(default)]
+        clip: Option<String>,
+        #[serde(default)]
+        prompt_clip: Option<String>,
     },
     CodeGap {
         id: String,
@@ -94,6 +144,10 @@ pub enum QuizDefinition {
         prompt: Option<String>,
         code: String,
         gaps: HashMap<String, GapDefinition>,
+        #[serde(default)]
+        clip: Option<String>,
+        #[serde(default)]
+        prompt_clip: Option<String>,
     },
 }
 
@@ -104,6 +158,16 @@ impl QuizDefinition {
                 id
             }
         }
+    }
+
+    /// The raw `clip:` / `prompt_clip:` strings, before parsing.
+    pub fn clip_sources(&self) -> (Option<&str>, Option<&str>) {
+        let (answer, prompt) = match self {
+            Self::Cloze { clip, prompt_clip, .. }
+            | Self::MultipleChoice { clip, prompt_clip, .. }
+            | Self::CodeGap { clip, prompt_clip, .. } => (clip, prompt_clip),
+        };
+        (answer.as_deref(), prompt.as_deref())
     }
 }
 
@@ -223,18 +287,25 @@ pub enum CardContent {
     Cloze {
         prompt: String,
         cloze: u32,
+        /// Defaulted so cards indexed before clips existed still deserialize.
+        #[serde(default, skip_serializing_if = "CardClips::is_empty")]
+        clips: CardClips,
     },
     MultipleChoice {
         mode: ChoiceMode,
         question: String,
         answers: Vec<ChoiceAnswer>,
         explanation: Option<String>,
+        #[serde(default, skip_serializing_if = "CardClips::is_empty")]
+        clips: CardClips,
     },
     CodeGap {
         language: String,
         prompt: Option<String>,
         code: String,
         gaps: HashMap<String, GapDefinition>,
+        #[serde(default, skip_serializing_if = "CardClips::is_empty")]
+        clips: CardClips,
     },
 }
 
@@ -331,12 +402,12 @@ pub fn card_capabilities() -> Vec<CardCapability> {
         CardCapability {
             card_type: "cloze",
             label: "Cloze",
-            template: "```quiz\nid: ${id}\ntype: cloze\nprompt: |\n  Write the question with {{c1::the answer::an optional hint}}.\n```",
+            template: "```quiz\nid: ${id}\ntype: cloze\nprompt: |\n  Write the question with {{c1::the answer::an optional hint}}.\n# clip: URL 06:54-07:20  Optional label — shown on reveal.\n```",
         },
         CardCapability {
             card_type: "multiple-choice",
             label: "Multiple choice",
-            template: "```quiz\nid: ${id}\ntype: multiple-choice\nmode: single\nquestion: |\n  Write the question here.\nanswers:\n  - text: Correct answer\n    correct: true\n  - text: Distractor\n    correct: false\nexplanation: |\n  Explain why the answer is correct.\n```",
+            template: "```quiz\nid: ${id}\ntype: multiple-choice\nmode: single\nquestion: |\n  Write the question here.\nanswers:\n  - text: Correct answer\n    correct: true\n  - text: Distractor\n    correct: false\nexplanation: |\n  Explain why the answer is correct.\n# clip: URL 06:54-07:20  Optional label — shown on reveal.\n```",
         },
         CardCapability {
             card_type: "code-gap",
@@ -514,6 +585,29 @@ pub fn validate_quiz(quiz: &QuizDefinition) -> Vec<String> {
     if quiz.id().trim().is_empty() {
         errors.push("quiz ID must not be empty".into());
     }
+
+    // A clip is only useful if it names a moment that can actually be played.
+    let (answer_clip, prompt_clip) = quiz.clip_sources();
+    for (field, raw) in [("clip", answer_clip), ("prompt_clip", prompt_clip)] {
+        let Some(raw) = raw else { continue };
+        match crate::parser::parse_clip(raw) {
+            None => errors.push(format!("`{field}` is empty")),
+            Some(clip) => {
+                if !clip.url.starts_with("http://") && !clip.url.starts_with("https://") {
+                    errors.push(format!("`{field}` must start with a URL"));
+                }
+                if let Some(end) = clip.end {
+                    if end <= clip.start {
+                        errors.push(format!(
+                            "`{field}` ends at {end}s, which is not after its start of {}s",
+                            clip.start
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     match quiz {
         QuizDefinition::Cloze { prompt, .. } => {
             let marker = regex::Regex::new(r"\{\{c(\d+)::([^}:]+)(?:::[^}]+)?\}\}").unwrap();

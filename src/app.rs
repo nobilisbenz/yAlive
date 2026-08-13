@@ -446,6 +446,7 @@ impl App {
             }
             KeyCode::Char('e') if self.page == Page::Dashboard => self.open_selected(terminal)?,
             KeyCode::Char('o') if self.page == Page::Dashboard => self.open_selected_url()?,
+            KeyCode::Char('v') if self.page == Page::Dashboard => self.play_selected_video()?,
             KeyCode::Char('i') if self.page == Page::Dashboard => self.open_selected_image()?,
             _ => {}
         }
@@ -699,6 +700,46 @@ impl App {
             }
             return Ok(false);
         }
+        // `v` plays the card's clip — the answer-side one once revealed, the
+        // prompt-side one before. Same key as the Dashboard, same template.
+        if key.code == KeyCode::Char('v') {
+            let revealed = session.phase == ReviewPhase::Revealed;
+            let clip = session.card().and_then(|card| {
+                let clips = match &card.content {
+                    CardContent::Cloze { clips, .. }
+                    | CardContent::MultipleChoice { clips, .. }
+                    | CardContent::CodeGap { clips, .. } => clips.clone(),
+                    CardContent::Section { .. } => Default::default(),
+                };
+                if revealed {
+                    clips.answer.or(clips.prompt)
+                } else {
+                    clips.prompt
+                }
+            });
+            match clip {
+                Some(clip) => {
+                    let template = self
+                        .config
+                        .player
+                        .clone()
+                        .unwrap_or_else(crate::player::default_template);
+                    let seconds = (clip.start > 0).then_some(clip.start);
+                    self.status = match crate::player::play(&template, &clip.url, seconds) {
+                        Ok(_) => format!(
+                            "playing {} at {}",
+                            clip.url,
+                            crate::player::format_hms(clip.start)
+                        ),
+                        Err(e) => format!("{e:#}"),
+                    };
+                }
+                None if revealed => self.status = "this card has no clip".into(),
+                None => self.status = "no clip until the answer is revealed".into(),
+            }
+            return Ok(false);
+        }
+
         if session.phase == ReviewPhase::Revealed {
             if let KeyCode::Char(rating @ '1'..='4') = key.code {
                 let rating = rating.to_digit(10).unwrap();
@@ -1465,6 +1506,53 @@ impl App {
                 self.status = format!("vault synced on branch {}", summary.branch);
             }
             Err(error) => self.status = format!("sync failed: {error:#}"),
+        }
+        Ok(())
+    }
+
+    /// Play the `@video` on the selected section, in the configured player.
+    ///
+    /// Prefers the parsed action — the author declared both the URL and the
+    /// moment there — and falls back to the first video URL in the body, which
+    /// covers a section that carries a link without the `@video` line.
+    fn play_selected_video(&mut self) -> Result<()> {
+        let Some(section) = self.selected_dashboard_section() else {
+            return Ok(());
+        };
+        let uid = section.uid.clone();
+        let body = section.body.clone();
+
+        let action = self
+            .db
+            .actions_for(&[uid])?
+            .into_iter()
+            .find(|action| action.kind == "video");
+
+        let (url, seconds) = match action {
+            Some(action) => (action.target, action.timestamp_seconds),
+            None => match crate::player::first_video_url(&body) {
+                Some(url) => (url, None),
+                None => {
+                    self.status = "no @video or video URL in this section".into();
+                    return Ok(());
+                }
+            },
+        };
+
+        let template = self
+            .config
+            .player
+            .clone()
+            .unwrap_or_else(crate::player::default_template);
+
+        match crate::player::play(&template, &url, seconds) {
+            Ok(_) => {
+                self.status = match seconds {
+                    Some(s) => format!("playing {url} at {}", crate::player::format_hms(s)),
+                    None => format!("playing {url}"),
+                };
+            }
+            Err(e) => self.status = format!("{e:#}"),
         }
         Ok(())
     }
@@ -2697,7 +2785,7 @@ fn review_text(session: &ReviewSession, card: &ReviewCard) -> Text<'static> {
                 ));
             }
         }
-        CardContent::Cloze { prompt, cloze } => {
+        CardContent::Cloze { prompt, cloze, .. } => {
             lines.extend(render_cloze(
                 prompt,
                 *cloze,
@@ -2761,6 +2849,7 @@ fn review_text(session: &ReviewSession, card: &ReviewCard) -> Text<'static> {
             prompt,
             code,
             gaps,
+            ..
         } => {
             if let Some(prompt) = prompt {
                 lines.extend(prompt.lines().map(|line| Line::raw(line.to_string())));

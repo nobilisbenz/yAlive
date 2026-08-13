@@ -9,8 +9,8 @@ use regex::Regex;
 use serde::Deserialize;
 
 use crate::model::{
-    CardContent, CardDefinition, Diagnostic, ParsedAction, ParsedNote, ParsedSection,
-    QuizDefinition, Relation, validate_quiz,
+    CardClips, CardContent, CardDefinition, ClipRef, Diagnostic, ParsedAction, ParsedNote,
+    ParsedSection, QuizDefinition, Relation, validate_quiz,
 };
 
 #[derive(Default, Deserialize)]
@@ -169,7 +169,19 @@ pub fn parse_note(path: &Path, vault: &Path) -> Result<ParsedNote> {
                 });
             }
             if errors.is_empty() {
-                cards.extend(cards_from_quiz(&uid, quiz)?);
+                // A quiz with no `clip:` inherits the section's own `@video`, so
+                // the common case needs no new syntax at all.
+                let inherited = actions
+                    .iter()
+                    .find(|action| action.kind == "video")
+                    .map(|action| ClipRef {
+                        video_id: youtube_id(&action.target),
+                        url: action.target.clone(),
+                        start: action.timestamp_seconds.unwrap_or(0),
+                        end: None,
+                        label: None,
+                    });
+                cards.extend(cards_from_quiz(&uid, quiz, inherited.as_ref())?);
             }
         }
         sections.push(ParsedSection {
@@ -245,7 +257,11 @@ fn parse_actions(body: &str, note_dir: &Path, pattern: &Regex) -> Vec<ParsedActi
                         None => (rest, ""),
                     };
                     let (clean, embedded) = strip_url_timestamp(url);
-                    let seconds = parse_timestamp(trailing).or(embedded);
+                    // Only the first token is a timestamp candidate: the
+                    // documented form is `@video URL 06:54  Label`, and feeding
+                    // the label to the parser made it reject the whole thing.
+                    let stamp = trailing.split_whitespace().next().unwrap_or_default();
+                    let seconds = parse_timestamp(stamp).or(embedded);
                     ParsedAction {
                         kind: "video".into(),
                         // Stored clean and rebuilt at launch time by trusted code (spec
@@ -354,6 +370,64 @@ fn parse_timestamp(text: &str) -> Option<u64> {
 ///
 /// A note author who copied a link from YouTube's "share at current time" gets the
 /// timestamp honoured without having to restate it.
+/// Parse a `clip:` value — `URL`, `URL 06:54`, `URL 06:54-07:20`, or any of
+/// those followed by a label.
+///
+/// The range separator is `-`, which cannot collide with a timestamp: `06:54`
+/// uses colons, and the `1h2m3s` form has no hyphen either.
+pub fn parse_clip(raw: &str) -> Option<ClipRef> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let (url, trailing) = match raw.split_once(char::is_whitespace) {
+        Some((url, rest)) => (url, rest.trim()),
+        None => (raw, ""),
+    };
+
+    let (clean, embedded) = strip_url_timestamp(url);
+
+    // The first token after the URL is the range; anything after it is a label.
+    let (range, label) = match trailing.split_once(char::is_whitespace) {
+        Some((range, rest)) => (range, rest.trim()),
+        None => (trailing, ""),
+    };
+
+    let (start, end) = match range.split_once('-') {
+        Some((from, to)) => (parse_timestamp(from), parse_timestamp(to)),
+        None => (parse_timestamp(range), None),
+    };
+
+    // A `range` that parsed as nothing was really a label.
+    let (start, label) = match start {
+        Some(start) => (Some(start), label),
+        None if !range.is_empty() => (None, trailing),
+        None => (None, label),
+    };
+
+    Some(ClipRef {
+        video_id: youtube_id(&clean),
+        url: clean,
+        start: start.or(embedded).unwrap_or(0),
+        end,
+        label: (!label.is_empty()).then(|| label.to_string()),
+    })
+}
+
+/// The 11-character id out of any YouTube URL shape, or `None` for anything else.
+fn youtube_id(url: &str) -> Option<String> {
+    if !url.contains("youtube.com") && !url.contains("youtu.be") {
+        return None;
+    }
+    let pattern = Regex::new(r"(?:v=|/v/|youtu\.be/|/embed/|/shorts/|/live/)([A-Za-z0-9_-]{11})")
+        .ok()?;
+    pattern
+        .captures(url)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
 fn strip_url_timestamp(url: &str) -> (String, Option<u64>) {
     let Some((base, query)) = url.split_once('?') else {
         return (url.to_string(), None);
@@ -470,10 +544,25 @@ fn collect_quiz_blocks(
     blocks
 }
 
-fn cards_from_quiz(section_uid: &str, quiz: &QuizDefinition) -> Result<Vec<CardDefinition>> {
+fn cards_from_quiz(
+    section_uid: &str,
+    quiz: &QuizDefinition,
+    inherited: Option<&ClipRef>,
+) -> Result<Vec<CardDefinition>> {
+    let (answer_src, prompt_src) = quiz.clip_sources();
+    // An explicit `clip:` wins; otherwise the section's `@video` becomes the
+    // answer-side clip. A `prompt_clip:` is never inherited — putting a video
+    // beside the question is a deliberate choice about what the card tests.
+    let clips = CardClips {
+        prompt: prompt_src.and_then(parse_clip),
+        answer: answer_src
+            .and_then(parse_clip)
+            .or_else(|| inherited.cloned()),
+    };
+
     let mut cards = Vec::new();
     match quiz {
-        QuizDefinition::Cloze { id, prompt } => {
+        QuizDefinition::Cloze { id, prompt, .. } => {
             let marker = Regex::new(r"\{\{c(\d+)::([^}:]+)(?:::[^}]+)?\}\}")?;
             let variants: HashSet<u32> = marker
                 .captures_iter(prompt)
@@ -488,6 +577,7 @@ fn cards_from_quiz(section_uid: &str, quiz: &QuizDefinition) -> Result<Vec<CardD
                     CardContent::Cloze {
                         prompt: prompt.clone(),
                         cloze,
+                        clips: clips.clone(),
                     },
                 )?);
             }
@@ -498,6 +588,7 @@ fn cards_from_quiz(section_uid: &str, quiz: &QuizDefinition) -> Result<Vec<CardD
             question,
             answers,
             explanation,
+            ..
         } => cards.push(make_card(
             section_uid,
             id,
@@ -508,6 +599,7 @@ fn cards_from_quiz(section_uid: &str, quiz: &QuizDefinition) -> Result<Vec<CardD
                 question: question.clone(),
                 answers: answers.clone(),
                 explanation: explanation.clone(),
+                clips: clips.clone(),
             },
         )?),
         QuizDefinition::CodeGap {
@@ -516,6 +608,7 @@ fn cards_from_quiz(section_uid: &str, quiz: &QuizDefinition) -> Result<Vec<CardD
             prompt,
             code,
             gaps,
+            ..
         } => cards.push(make_card(
             section_uid,
             id,
@@ -526,6 +619,7 @@ fn cards_from_quiz(section_uid: &str, quiz: &QuizDefinition) -> Result<Vec<CardD
                 prompt: prompt.clone(),
                 code: code.clone(),
                 gaps: gaps.clone(),
+                clips: clips.clone(),
             },
         )?),
     }
@@ -628,6 +722,16 @@ mod tests {
     use super::*;
     use crate::model::card_capabilities;
 
+    /// Write a note into a temp vault and parse it, returning both so the
+    /// tempdir outlives the borrow.
+    fn note_from(source: &str) -> (tempfile::TempDir, ParsedNote) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rust.md");
+        std::fs::write(&path, source).unwrap();
+        let note = parse_note(&path, dir.path()).unwrap();
+        (dir, note)
+    }
+
     fn actions_in(body: &str) -> Vec<ParsedAction> {
         let pattern = Regex::new(r"(?m)^\s*@(file|video|app|project|url)\s+(.+?)\s*$").unwrap();
         parse_actions(body, Path::new("/home/nabi/brain"), &pattern)
@@ -694,6 +798,116 @@ mod tests {
     fn an_explicit_timestamp_beats_one_embedded_in_the_url() {
         let actions = actions_in("@video https://youtu.be/ABC?t=10 1:00\n");
         assert_eq!(actions[0].timestamp_seconds, Some(60));
+    }
+
+    #[test]
+    fn clip_values_carry_a_range_and_an_optional_label() {
+        let clip = parse_clip("https://youtu.be/dQw4w9WgXcQ 06:54-07:20  The borrow checker bit")
+            .unwrap();
+        assert_eq!(clip.url, "https://youtu.be/dQw4w9WgXcQ");
+        assert_eq!(clip.video_id.as_deref(), Some("dQw4w9WgXcQ"));
+        assert_eq!(clip.start, 414);
+        assert_eq!(clip.end, Some(440));
+        assert_eq!(clip.label.as_deref(), Some("The borrow checker bit"));
+
+        // A start with no end means "play to the end".
+        let clip = parse_clip("https://youtu.be/dQw4w9WgXcQ 06:54").unwrap();
+        assert_eq!(clip.start, 414);
+        assert_eq!(clip.end, None);
+
+        // A bare URL is a whole video.
+        let clip = parse_clip("https://youtu.be/dQw4w9WgXcQ").unwrap();
+        assert_eq!(clip.start, 0);
+        assert_eq!(clip.label, None);
+
+        // A timestamp already in the URL is lifted out, as `@video` does.
+        let clip = parse_clip("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=90s").unwrap();
+        assert_eq!(clip.url, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        assert_eq!(clip.start, 90);
+
+        // Text where a range would be is a label, not a failed parse.
+        let clip = parse_clip("https://youtu.be/dQw4w9WgXcQ  Just a label").unwrap();
+        assert_eq!(clip.start, 0);
+        assert_eq!(clip.label.as_deref(), Some("Just a label"));
+
+        // A non-YouTube URL is still a clip, just without an id to embed.
+        let clip = parse_clip("https://example.com/talk.mp4 1:00").unwrap();
+        assert_eq!(clip.video_id, None);
+        assert_eq!(clip.start, 60);
+
+        assert!(parse_clip("   ").is_none());
+    }
+
+    #[test]
+    fn a_quiz_without_a_clip_inherits_the_sections_video() {
+        let (_dir, note) = note_from(
+            "---\nid: rust\ntitle: Rust\n---\n\n# Rust {#root}\n\n\
+             @video https://youtu.be/dQw4w9WgXcQ 06:54  Chapter on borrowing\n\n\
+             ```quiz\nid: q1\ntype: cloze\nprompt: A {{c1::mutable}} borrow is exclusive.\n```\n",
+        );
+
+        let clips = match &note.sections[0].cards[0].content {
+            CardContent::Cloze { clips, .. } => clips.clone(),
+            other => panic!("expected a cloze card, got {other:?}"),
+        };
+        let answer = clips.answer.expect("should have inherited the @video");
+        assert_eq!(answer.url, "https://youtu.be/dQw4w9WgXcQ");
+        assert_eq!(answer.start, 414);
+        // Inheritance never fills the prompt side: that is a deliberate choice.
+        assert!(clips.prompt.is_none());
+    }
+
+    #[test]
+    fn an_explicit_clip_beats_the_inherited_one_and_prompt_clip_is_separate() {
+        let (_dir, note) = note_from(
+            "---\nid: rust\ntitle: Rust\n---\n\n# Rust {#root}\n\n\
+             @video https://youtu.be/AAAAAAAAAAA 1:00\n\n\
+             ```quiz\nid: q1\ntype: cloze\nprompt: A {{c1::mutable}} borrow.\n\
+             clip: https://youtu.be/BBBBBBBBBBB 2:00-3:00\n\
+             prompt_clip: https://youtu.be/CCCCCCCCCCC 4:00\n```\n",
+        );
+
+        let clips = match &note.sections[0].cards[0].content {
+            CardContent::Cloze { clips, .. } => clips.clone(),
+            other => panic!("expected a cloze card, got {other:?}"),
+        };
+        assert_eq!(clips.answer.as_ref().unwrap().video_id.as_deref(), Some("BBBBBBBBBBB"));
+        assert_eq!(clips.answer.as_ref().unwrap().end, Some(180));
+        assert_eq!(clips.prompt.as_ref().unwrap().video_id.as_deref(), Some("CCCCCCCCCCC"));
+        assert_eq!(clips.prompt.as_ref().unwrap().start, 240);
+    }
+
+    #[test]
+    fn a_backwards_clip_range_is_a_diagnostic() {
+        let (_dir, note) = note_from(
+            "---\nid: rust\ntitle: Rust\n---\n\n# Rust {#root}\n\n\
+             ```quiz\nid: q1\ntype: cloze\nprompt: A {{c1::mutable}} borrow.\n\
+             clip: https://youtu.be/BBBBBBBBBBB 3:00-2:00\n```\n",
+        );
+
+        assert!(
+            note.diagnostics
+                .iter()
+                .any(|d| d.message.contains("not after its start")),
+            "expected a range diagnostic, got {:?}",
+            note.diagnostics
+        );
+    }
+
+    #[test]
+    fn a_label_after_the_timestamp_does_not_swallow_it() {
+        // The documented form carries a human label: `@video URL 06:54  Label`.
+        let actions = actions_in("@video https://youtu.be/ABC 06:54  Chapter on borrowing\n");
+        assert_eq!(actions[0].target, "https://youtu.be/ABC");
+        assert_eq!(actions[0].timestamp_seconds, Some(414));
+
+        // A label with no timestamp still leaves the URL's own one intact.
+        let actions = actions_in("@video https://youtu.be/ABC?t=90 Just a label\n");
+        assert_eq!(actions[0].timestamp_seconds, Some(90));
+
+        // And a bare label with nothing to fall back on is simply no timestamp.
+        let actions = actions_in("@video https://youtu.be/ABC Just a label\n");
+        assert_eq!(actions[0].timestamp_seconds, None);
     }
 
     #[test]
