@@ -9,6 +9,7 @@
 | <img src="assets/icons/yalive.svg" width="64" alt="Black circle with a blue center" /> | **yalive** | [Linux x86_64](https://github.com/nobilisbenz/yAlive/releases/latest/download/yalive-linux-x86_64.tar.gz) | Write, search, connect, and review from the terminal. |
 | <img src="assets/icons/ygraphy.svg" width="64" alt="Black circle with a red center" /> | **yGraphy** | [Linux x86_64](https://github.com/nobilisbenz/yGraphy/releases/latest/download/ygraphy-linux-x86_64.tar.gz) | Explore the vault as an interactive native graph. |
 | <img src="assets/icons/yreviewy.svg" width="64" alt="Black circle with a lime center" /> | **yReviewy** | [Android ARM64](https://github.com/nobilisbenz/yReviewy/releases/latest/download/yreviewy-android-arm64.apk) | Review cards offline from an Android phone. |
+| | **yClippy** | [Linux x86_64](https://github.com/nobilisbenz/yClippy/releases/latest/download/yclippy-linux-amd64.deb), [Android ARM64](https://github.com/nobilisbenz/yClippy/releases/latest/download/yclippy-android-arm64.apk) | Watch, trim, and name moments in YouTube videos. The video surface of the vault. |
 
 Downloads are published in each app's GitHub repository. Every release also includes `SHA256SUMS`.
 
@@ -85,6 +86,26 @@ cargo run --release -- --vault ../examples/vault
 ```
 
 Omit `--vault` to use the vault most recently opened by `yalive`. Drag a section to reposition it, drag the canvas to pan, double-click a section to focus it in the running TUI, use the wheel to zoom, press `Space` to pause the simulation, `F` to fit, and `Esc` to exit.
+
+### yClippy
+
+[`yClippy/`](yClippy/) is the video surface of the vault — a Tauri 2 + Svelte 5 desktop and Android app for watching, trimming, and naming moments in YouTube videos. A single line of Markdown is the whole contract:
+
+```markdown
+@video https://www.youtube.com/watch?v=dQw4w9WgXcQ 06:54  Chapter on borrowing
+```
+
+The line is indexable by `yalive`, searchable by `yGraphy`, and replayable from anywhere. yClippy speaks the line out via the `play` subcommand:
+
+```bash
+yclippy play https://www.youtube.com/watch?v=dQw4w9WgXcQ --at 414
+yclippy list --json | jq '.items[] | {title, video_id}'
+yclippy add https://youtu.be/dQw4w9WgXcQ --folder "Rust"
+```
+
+Brain Dock (`yy`) launches it with one config line — see `[openers] video = ["yclippy", "play", "{url}", "--at", "{seconds}"]` in `config/brain.toml`. The Neovim plugin exposes `:YClippyPlay`, `:YClippyLibrary`, and `:YClippyInsert`. The TUI binds `v` on the Dashboard to play the `@video` under the cursor. The phone answers the same intent through a `yclippy://play?v=…&t=…` deep link registered in the manifest.
+
+The library lives at `<vault>/.notes/yclippy/library.json` and is sync'd via the GitHub Contents API. Per-device append-only logs at `<vault>/.notes/yclippy/devices/<device>.jsonl` give two phones concurrent edits without Git conflicts; `compact_library` on desktop sync rewrites the canonical state and drops processed logs.
 
 Machine-readable editor commands are also available. They are versioned JSON so editor plugins do not need to read the disposable SQLite schema:
 
