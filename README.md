@@ -9,9 +9,14 @@
 | <img src="assets/icons/yalive.svg" width="64" alt="Black circle with a blue center" /> | **yalive** | [Linux x86_64](https://github.com/nobilisbenz/yAlive/releases/latest/download/yalive-linux-x86_64.tar.gz) | Write, search, connect, and review from the terminal. |
 | <img src="assets/icons/ygraphy.svg" width="64" alt="Black circle with a red center" /> | **yGraphy** | [Linux x86_64](https://github.com/nobilisbenz/yGraphy/releases/latest/download/ygraphy-linux-x86_64.tar.gz) | Explore the vault as an interactive native graph. |
 | <img src="assets/icons/yreviewy.svg" width="64" alt="Black circle with a lime center" /> | **yReviewy** | [Android ARM64](https://github.com/nobilisbenz/yReviewy/releases/latest/download/yreviewy-android-arm64.apk) | Review cards offline from an Android phone. |
-| | **yClippy** | [Linux x86_64](https://github.com/nobilisbenz/yClippy/releases/latest/download/yclippy-linux-amd64.deb), [Android ARM64](https://github.com/nobilisbenz/yClippy/releases/latest/download/yclippy-android-arm64.apk) | Watch, trim, and name moments in YouTube videos. The video surface of the vault. |
+| <img src="assets/icons/yclippy.svg" width="64" alt="Black circle with an amber center" /> | **yClippy** | [Linux x86_64](https://github.com/nobilisbenz/yClippy/releases/latest/download/yclippy-linux-amd64.deb), [Android ARM64](https://github.com/nobilisbenz/yClippy/releases/latest/download/yclippy-android-arm64.apk) | Watch, trim, and name moments in YouTube videos. The video surface of the vault. |
 
 Downloads are published in each app's GitHub repository. Every release also includes `SHA256SUMS`.
+
+The four share one palette, one spacing scale, and one set of easing curves,
+generated from `assets/design/tokens.json` into each app's own language. Each
+owns exactly one accent — the hue at the centre of its icon. See
+[`DESIGN.md`](DESIGN.md).
 
 ## Run
 

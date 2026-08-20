@@ -7,6 +7,7 @@
 mod keymap;
 mod palette;
 mod theme;
+mod tokens;
 mod ui;
 mod util;
 

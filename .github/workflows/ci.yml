@@ -15,6 +15,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  design:
+    name: Design tokens
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Four apps in four languages keep their palettes in sync through a
+      # generator rather than through discipline. This fails when the committed
+      # output no longer matches `assets/design/tokens.json`.
+      - name: Check generated tokens
+        run: python3 assets/design/generate.py --check
+
   rust:
     name: Rust
     runs-on: ubuntu-22.04
