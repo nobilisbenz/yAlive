@@ -596,13 +596,13 @@ pub fn validate_quiz(quiz: &QuizDefinition) -> Vec<String> {
                 if !clip.url.starts_with("http://") && !clip.url.starts_with("https://") {
                     errors.push(format!("`{field}` must start with a URL"));
                 }
-                if let Some(end) = clip.end {
-                    if end <= clip.start {
-                        errors.push(format!(
-                            "`{field}` ends at {end}s, which is not after its start of {}s",
-                            clip.start
-                        ));
-                    }
+                if let Some(end) = clip.end
+                    && end <= clip.start
+                {
+                    errors.push(format!(
+                        "`{field}` ends at {end}s, which is not after its start of {}s",
+                        clip.start
+                    ));
                 }
             }
         }

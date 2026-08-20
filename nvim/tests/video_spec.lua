@@ -96,6 +96,29 @@ check(
   { "mpv", "--start=5", "https://example.com/a%20b" }
 )
 
+-- ── resolve_player ────────────────────────────────────────────────────────
+-- The chain must always end somewhere runnable, and must never return an empty
+-- template, whatever happens to be installed on the machine running this.
+do
+  internal.set_player(nil)
+  local resolved = internal.resolve_player()
+  check("resolution yields a non-empty template", type(resolved) == "table" and #resolved > 0, true)
+  local has_url = false
+  for _, part in ipairs(resolved) do
+    if part:find("{url}", 1, true) then has_url = true end
+  end
+  check("resolution yields a template carrying {url}", has_url, true)
+
+  -- A configured player that is not installed must not become the answer.
+  internal.set_player({ "definitely-not-installed-xyz", "{url}" })
+  check(
+    "a missing configured player falls back",
+    internal.resolve_player()[1] ~= "definitely-not-installed-xyz",
+    true
+  )
+  internal.set_player(nil)
+end
+
 print(failures == 0 and "\nall passed" or ("\n" .. failures .. " failed"))
 if failures > 0 then
   vim.cmd("cq")

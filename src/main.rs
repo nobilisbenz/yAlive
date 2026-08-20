@@ -150,7 +150,7 @@ fn video_items(db: &Database, section_uid: Option<&str>) -> Result<Vec<serde_jso
                 "note_title": section.map(|s| s.note_title.clone()).unwrap_or_default(),
                 "section_uid": action.section_uid,
                 "path": section.map(|s| s.path.display().to_string()),
-                "line": action.line.map(u32::from).or(section.map(|s| s.start_line as u32)),
+                "line": action.line.or(section.map(|s| s.start_line as u32)),
             })
         })
         .collect())

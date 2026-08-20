@@ -12,12 +12,70 @@
 //! timestamp separately gets it rebuilt into the URL here, in trusted code, from
 //! the parsed number rather than by string-mangling what the author wrote.
 
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 
-/// The default when `.notes/config.toml` sets no `player`. Opens in whatever
-/// handles the URL, with the timestamp rebuilt in by [`expand`].
+/// Whether the first element of a template names something that exists.
+///
+/// A bare name is looked up on `PATH`; anything containing a separator is
+/// treated as a path. Same rule as yy's `opener_is_installed`, so the two agree
+/// about whether a given template is usable on this machine.
+pub fn is_installed(template: &[String]) -> bool {
+    let Some(program) = template.first() else {
+        return false;
+    };
+    if program.contains('/') {
+        return Path::new(program).exists();
+    }
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|directory| directory.join(program).exists())
+}
+
+/// The player to use, given whatever `.notes/config.toml` asked for.
+///
+/// Resolution is `configured` → `yclippy` → `mpv` → `xdg-open`, and it is the
+/// same chain yy and the Neovim plugin follow, so one `@video` line opens the
+/// same way whichever surface you press the key in. Previously the TUI always
+/// defaulted to `xdg-open` while the Neovim plugin always defaulted to
+/// `yclippy`, so the same line behaved differently depending on where you were
+/// standing.
+///
+/// A configured player that is not installed falls back silently rather than
+/// failing: a config synced from another machine should still open the video.
+pub fn resolve(configured: Option<&[String]>) -> Vec<String> {
+    if let Some(template) = configured
+        && !template.is_empty()
+        && is_installed(template)
+    {
+        return template.to_vec();
+    }
+    for candidate in [
+        vec![
+            "yclippy".to_string(),
+            "play".to_string(),
+            "{url}".to_string(),
+            "--at".to_string(),
+            "{seconds}".to_string(),
+        ],
+        vec![
+            "mpv".to_string(),
+            "--start={seconds}".to_string(),
+            "{url}".to_string(),
+        ],
+    ] {
+        if is_installed(&candidate) {
+            return candidate;
+        }
+    }
+    default_template()
+}
+
+/// The last resort: whatever handles the URL, with the timestamp rebuilt in by
+/// [`expand`].
 pub fn default_template() -> Vec<String> {
     vec!["xdg-open".to_string(), "{url}".to_string()]
 }
@@ -134,6 +192,42 @@ mod tests {
         let out = expand(&template, "https://example.com/a b", Some(5));
         assert_eq!(out.len(), 3);
         assert_eq!(out[2], "https://example.com/a b");
+    }
+
+    /// The resolver must never hand back an empty template, whatever is or is
+    /// not installed on the machine running the test.
+    #[test]
+    fn resolution_always_produces_a_runnable_template() {
+        for configured in [
+            None,
+            Some(argv(&["definitely-not-installed-xyz", "{url}"])),
+            Some(argv(&[])),
+        ] {
+            let resolved = resolve(configured.as_deref());
+            assert!(!resolved.is_empty());
+            assert!(resolved.iter().any(|part| part.contains("{url}")));
+        }
+    }
+
+    #[test]
+    fn an_installed_configured_player_wins() {
+        // `sh` is on PATH everywhere this builds.
+        let configured = argv(&["sh", "-c", "true {url}"]);
+        assert_eq!(resolve(Some(&configured)), configured);
+    }
+
+    /// A player configured on another machine and synced here must not turn the
+    /// video key into an error.
+    #[test]
+    fn a_missing_configured_player_falls_back_silently() {
+        let configured = argv(&["definitely-not-installed-xyz", "{url}"]);
+        let resolved = resolve(Some(&configured));
+        assert_ne!(resolved, configured);
+    }
+
+    #[test]
+    fn is_installed_rejects_an_empty_template() {
+        assert!(!is_installed(&[]));
     }
 
     #[test]

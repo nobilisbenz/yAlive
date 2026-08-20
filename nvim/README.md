@@ -31,8 +31,20 @@ With lazy.nvim, point at the plugin's `nvim` directory:
     { "<leader>yo", "<cmd>YaliveOutgoingLink<cr>", desc = "Yalive outgoing link" },
     { "<leader>yi", "<cmd>YaliveIngoingLink<cr>", desc = "Yalive ingoing link" },
     { "<leader>yr", "<cmd>YaliveRelations<cr>", desc = "Yalive relations" },
+    { "<leader>yv", "<cmd>YaliveVideos<cr>", desc = "Yalive videos" },
+    { "<leader>yp", "<cmd>YalivePlay<cr>", desc = "Yalive play video" },
   },
 }
+```
+
+The repository ships a ready-made spec at [`nvim/yalive.lua`](yalive.lua). It
+locates the plugin relative to itself and prefers an installed `yalive`, falling
+back to `target/release` or `target/debug` in the checkout, so it works without
+editing paths:
+
+```lua
+-- lua/plugins/yalive.lua
+return dofile("/path/to/yalive/nvim/yalive.lua")
 ```
 
 For development without installing the binary:
@@ -56,6 +68,15 @@ require("yalive").setup({
 | `:YaliveRelations` | Browse both outgoing relations and incoming backlinks |
 | `:YaliveIndex` | Reindex the vault |
 | `:YaliveDiagnostics` | Publish parser and broken-link diagnostics for the current buffer |
+| `:YaliveVideos` | Browse every `@video` in the vault and play one |
+| `:YalivePlay` | Play the `@video` on this line, the URL under the cursor, or the section's first clip |
+| `:YaliveLibrary [query]` | Browse the yClippy library and play a video or clip |
+| `:YaliveInsertClip [query]` | Insert an `@video` line for a clip chosen from the yClippy library |
+
+The three video commands were previously named `:YClippyPlay`, `:YClippyLibrary`,
+and `:YClippyInsert`. Those names still work as aliases, but the `Yalive` prefix
+is the one to use — they are this plugin's commands, and yClippy is simply the
+player they hand the clip to.
 
 `:YaliveBacklink` changes to the selected source buffer because yalive stores only outgoing links in Markdown. The edit is intentionally left unsaved for review.
 

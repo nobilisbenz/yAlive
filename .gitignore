@@ -1,7 +1,15 @@
 /target/
 /yGraphy/target/
+
+# The disposable index and the graph IPC files. Markdown is the source of
+# truth; everything here is rebuilt from it.
 **/.notes/*.sqlite
 **/.notes/*.sqlite-shm
 **/.notes/*.sqlite-wal
 **/.notes/ygraphy-open.json
 **/.notes/ygraphy-open.pending
+
+# The pi extension's dependencies. `pi/extensions/yalive/package-lock.json` is
+# committed, so `npm ci` reproduces this exactly — without it a `git add -A`
+# would sweep in tens of thousands of vendored files.
+node_modules/

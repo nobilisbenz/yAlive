@@ -32,7 +32,7 @@ cargo run -- --vault ~/Notes sync
 
 ### GitHub Sync
 
-The Options tab includes the complete setup flow: authenticate with GitHub CLI, enter the repository URL, and select Sync now. Yalive does not accept or store classic access tokens. Use either:
+The Options page — `Ctrl+k`, then "Options" — includes the complete setup flow: authenticate with GitHub CLI, enter the repository URL, and select Sync now. The palette also offers each of those three steps directly. Yalive does not accept or store classic access tokens. Use either:
 
 - `git@github.com:owner/vault.git` with an SSH key configured in GitHub.
 - `https://github.com/owner/vault.git` after the Options authentication action, or after running `gh auth login` and `gh auth setup-git`.
@@ -106,7 +106,16 @@ yclippy add https://youtu.be/dQw4w9WgXcQ --folder "Rust"
 `list` is headless — it prints JSON and exits without starting the GUI, so
 pickers can shell out to it. `play` forwards to an already-running instance.
 
-Brain Dock (`yy`) launches it with one config line — see `[openers] video = ["yclippy", "play", "{url}", "--at", "{seconds}"]` in `config/brain.toml`. The Neovim plugin exposes `:YClippyPlay`, `:YClippyLibrary`, `:YClippyInsert`, and `:YaliveVideos`. The TUI binds `v` on the Dashboard to play the `@video` on the selected section. The phone answers the same intent through a `yclippy://play?v=…&t=…` deep link registered in the manifest.
+Every surface resolves a player the same way — configured, then `yclippy`, then
+`mpv`, then `xdg-open` with the timestamp rebuilt into the URL — so installing
+yClippy is enough to make it the player everywhere, with no configuration to
+edit. Brain Dock (`yy`) reads `[openers] video` from `config/brain.toml`, yalive
+reads `player` from `.notes/config.toml`, and the Neovim plugin reads `player`
+from its `setup{}`; all three fall back through the same chain. The Neovim plugin
+exposes `:YalivePlay`, `:YaliveLibrary`, `:YaliveInsertClip`, and `:YaliveVideos`
+(the older `:YClippy*` names still work). The TUI binds `v` on the Library page
+to play the `@video` on the selected section. The phone answers the same intent
+through a `yclippy://play?v=…&t=…` deep link registered in the manifest.
 
 The library is a local SQLite database. It syncs into the vault repository:
 
@@ -144,35 +153,57 @@ per `@video` action, so a plugin never has to parse Markdown to build a picker.
 
 ## Keys
 
-| Mode | Keys |
+The footer always lists the keys that work where you are standing, so this table
+is a reference rather than something to memorise. `?` opens the full list for the
+current page.
+
+| Where | Keys |
 | --- | --- |
-| Pages | `1` dashboard, `2` reviews, `3` relations, `4` statistics, `5` cleanup, `6` options, `7` archived |
-| Panel focus | `Shift+h` left, `Shift+l` right, `Shift+j` down, `Shift+k` up |
-| Dashboard | `Enter` opens a note/section, `n` creates a note, `/` searches |
-| Dashboard | `g` or `b` relations/backlinks, `o` opens URL, `i` opens image |
-| Archive | `x` archives the selected note, section, quiz, or deck; `u` restores it on the archived page |
-| Review setup | `Enter` opens notes/sections, activates decks, or reviews cards |
-| Review setup | `Space` enrolls a section, `r` chooses a deck to review, `n` creates a deck |
-| Review setup | `[`/`]` choose active deck, `a` assign card, `x` archive selected item |
-| Deck review | `Enter` reviews due cards, `f` force-reviews every card even when not due; deckless cards are grouped under No deck |
-| Refresh | `Shift+r` reloads Markdown and SQLite-backed lists immediately |
-| Sync | `Ctrl+s` syncs the vault from any page or mode |
-| Relations | `j/k` selects in the focused panel, `Enter` follows incoming/outgoing links or opens the center section |
-| Cleanup | `Enter` opens an item, `a` assigns a card, `d` deletes an unreferenced image |
-| Options | `j/k` selects, `h/l` or arrows changes values, `Space` toggles, `Enter` configures GitHub sync or opens/creates a vault |
-| Search | type to search, arrows navigate, `Enter` open, `Esc` cancel |
-| Review | `Space` reveal cloze, `j/k` and `Space` choose answers |
-| Review | type code gaps, `Tab` changes gap, `Enter` checks |
-| Review | `v` play this card's clip |
+| Tabs | `1` Library, `2` Review, `3` Relations, `4` Stats |
+| Commands | `Ctrl+k` opens the palette: Clean, Options, Archived, sync, vault switching, and the one-off actions |
+| Everywhere | `j`/`k` or arrows move, `Shift+h/j/k/l` moves focus between panes, `/` searches, `Shift+r` re-reads the vault, `Ctrl+s` syncs, `?` shows every key, `q` quits |
+| Library | `Enter` opens a note or section, `n` creates a note, `g` jumps to its relations, `x` archives it |
+| Library | `v` plays the section's clip, `o` opens its URL, `i` opens its image — each offered only when the section actually carries one |
+| Review | `r` starts a session, `Space` enrols a section, `a` assigns a card to the active deck, `[`/`]` change the active deck, `n` creates a deck, `x` archives |
+| Deck chooser | `Enter` reviews due cards, `f` forces every card even when not due; deckless cards are grouped under No deck |
+| Relations | `j`/`k` selects in the focused pane, `Enter` follows a link or opens the middle section |
+| Clean | `Enter` opens an item, `a` assigns a card, `d` deletes an unreferenced image, `x` archives |
+| Options | `j`/`k` selects, `h`/`l` or arrows change a value, `Enter` runs an action |
+| Search | type to search, arrows navigate, `Enter` opens, `Esc` returns |
+| Review session | `Space` reveals a cloze or section; on a multiple-choice card `j`/`k` move, `Space` selects, `Enter` submits |
+| Review session | code-gap cards take typed text, `Tab` changes gap, `Enter` checks |
+| Review session | `v` plays this card's clip, `Esc` ends the session |
 | Rating | `1` Again, `2` Hard, `3` Good, `4` Easy |
 
-`e` uses `editor` from `.notes/config.toml`, then `$VISUAL`, `$EDITOR`, and finally `nvim`. The TUI suspends and returns to the same stable section after editing.
+Clean, Options, and Archived are reached from `Ctrl+k` rather than from a tab.
+The four tabs are what the vault is *for* — writing, reviewing, connecting, and
+measuring; the rest is maintenance, and `Esc` returns from it to the Library.
 
-`v` on the Dashboard plays the selected section's `@video` in the configured `player`, falling back to the first YouTube URL in the section body.
+`Enter` on a note or section opens `editor` from `.notes/config.toml`, then
+`$VISUAL`, `$EDITOR`, and finally `nvim`. The TUI suspends and returns to the
+same section afterwards.
 
-## Neovim
+`v` plays the selected section's `@video` in the resolved player, falling back to
+the first YouTube URL in the section body.
 
-A Neovim plugin is included in [`nvim/`](nvim/README.md). It discovers card templates and relation syntax from `yalive editor capabilities`, so adding a card type to the Rust capability registry makes it available without changing Lua. It provides fzf-backed card creation, section search, incoming/outgoing relation editing, relation navigation, automatic indexing, and diagnostics.
+## Editors and agents
+
+### Neovim
+
+A Neovim plugin is included in [`nvim/`](nvim/README.md). It discovers card templates and relation syntax from `yalive editor capabilities`, so adding a card type to the Rust capability registry makes it available without changing Lua. It provides fzf-backed card creation, section search, incoming/outgoing relation editing, relation navigation, automatic indexing, diagnostics, and the video commands.
+
+### pi
+
+[`pi/`](pi/README.md) is a project-local extension for the pi coding agent,
+registered through `.pi/settings.json`. It gives the agent tools that query the
+live index — search, relations, diagnostics, capabilities, videos — instead of
+grepping Markdown, plus slash commands and a system prompt that stays in sync
+with the Rust capability registry. Run `npm run check` in
+`pi/extensions/yalive/` after editing it.
+
+Both speak the same versioned `yalive editor …` JSON protocol and both refuse a
+protocol version they do not understand, so a bump surfaces as a clear error
+rather than as quietly wrong answers.
 
 ## Note Format
 
@@ -243,7 +274,7 @@ bury_siblings = true
 reindex_interval_ms = 1000
 ```
 
-`player` is the argv template `v` uses on the Dashboard to launch the `@video`
+`player` is the argv template `v` uses on the Library page to launch the `@video`
 action of the selected section. It shares its placeholder shape with yy's
 `[openers]`, so one template works in both. A template without `{seconds}` — the
 default, `["xdg-open", "{url}"]` — gets the timestamp rebuilt into the URL, so a

@@ -6,7 +6,9 @@ local config = {
   -- it shares its placeholder shape with yalive's `.notes/config.toml` and yy's
   -- `[openers]`, so one mental model covers all three.
   clipper = "yclippy",
-  player = { "yclippy", "play", "{url}", "--at", "{seconds}" },
+  -- Leave `player` unset to get the shared resolution chain below. Set it to an
+  -- argv template to pin one player.
+  player = nil,
   vault = nil,
   auto_index = true,
   diagnostics = true,
@@ -214,8 +216,33 @@ end
 -- Expands `{url}` and `{seconds}` per element, never re-splitting on
 -- whitespace. A template without `{seconds}` gets the timestamp rebuilt into
 -- the URL, so `{ "xdg-open", "{url}" }` still lands at the right moment.
-local function expand_player(url, seconds)
-  local template = config.player
+--- Resolve the player: configured → yclippy → mpv → xdg-open.
+---
+--- The same chain `src/player.rs` and yy's `[openers]` follow, so one `@video`
+--- line opens the same way from the TUI, the daemon, and here. This plugin used
+--- to hardcode yclippy while the TUI defaulted to `xdg-open`, so the same line
+--- behaved differently depending on which surface you pressed the key in.
+---
+--- A configured player that is not installed falls back silently: a config
+--- synced from another machine should still open the video.
+local function resolve_player()
+  local candidates = {}
+  if config.player and #config.player > 0 then
+    table.insert(candidates, config.player)
+  end
+  table.insert(candidates, { config.clipper or "yclippy", "play", "{url}", "--at", "{seconds}" })
+  table.insert(candidates, { "mpv", "--start={seconds}", "{url}" })
+  table.insert(candidates, { "xdg-open", "{url}" })
+  for _, template in ipairs(candidates) do
+    if vim.fn.executable(template[1]) == 1 then
+      return template
+    end
+  end
+  return candidates[#candidates]
+end
+
+local function expand_player(url, seconds, override)
+  local template = override or config.player
   if type(template) == "string" then
     template = { template, "{url}" }
   end
@@ -243,7 +270,7 @@ local function expand_player(url, seconds)
 end
 
 local function launch_video(url, seconds)
-  local argv = expand_player(url, seconds)
+  local argv = expand_player(url, seconds, resolve_player())
   if vim.fn.executable(argv[1]) ~= 1 then
     notify("Player not found: " .. argv[1], vim.log.levels.ERROR)
     return
@@ -536,16 +563,30 @@ local function create_commands()
   vim.api.nvim_create_user_command("YaliveRelations", M.relations, {})
   vim.api.nvim_create_user_command("YaliveIndex", function() M.index(false) end, {})
   vim.api.nvim_create_user_command("YaliveDiagnostics", function() M.diagnostics(0) end, {})
-  vim.api.nvim_create_user_command("YClippyPlay", M.play, {})
   vim.api.nvim_create_user_command("YaliveVideos", M.videos, {})
-  vim.api.nvim_create_user_command("YClippyLibrary", function(opts) M.library(opts.args) end, { nargs = "*" })
-  vim.api.nvim_create_user_command("YClippyInsert", function(opts) M.insert(opts.args) end, { nargs = "*" })
+  vim.api.nvim_create_user_command("YalivePlay", M.play, {})
+  vim.api.nvim_create_user_command("YaliveLibrary", function(opts) M.library(opts.args) end, { nargs = "*" })
+  vim.api.nvim_create_user_command("YaliveInsertClip", function(opts) M.insert(opts.args) end, { nargs = "*" })
+
+  -- The video commands shipped under a `YClippy` prefix, which put two
+  -- different names on one plugin's commands. They answer to `Yalive*` now;
+  -- the old names stay as aliases so existing configs keep working.
+  for old, new in pairs({
+    YClippyPlay = "YalivePlay",
+    YClippyLibrary = "YaliveLibrary",
+    YClippyInsert = "YaliveInsertClip",
+  }) do
+    vim.api.nvim_create_user_command(old, function(opts)
+      vim.cmd(new .. " " .. opts.args)
+    end, { nargs = "*" })
+  end
 end
 
 --- Pure helpers, exposed for `nvim/tests/`. Not part of the public API.
 M._internal = {
   format_hms = format_hms,
   expand_player = expand_player,
+  resolve_player = resolve_player,
   parse_video_line = parse_video_line,
   set_player = function(template) config.player = template end,
 }
@@ -560,6 +601,9 @@ function M.setup(options)
       pattern = "*.md",
       callback = function(event)
         if not vault_for(event.file) then return end
+        -- `editor diagnostics` reindexes the vault before it answers, so
+        -- running diagnostics already satisfies `auto_index`. Running both
+        -- would index the vault twice on every save.
         if config.diagnostics then
           M.diagnostics(event.buf)
         elseif config.auto_index then
